@@ -1,4 +1,4 @@
-# Bitok
+# Bitok ARM64 Linux Compatible
 
 Peer-to-peer electronic cash. Started from Bitcoin v0.3.19, the last release Satoshi ran.
 
