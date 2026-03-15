@@ -51,11 +51,11 @@ HAVE_AVX2 := $(shell grep -q avx2 /proc/cpuinfo 2>/dev/null && echo 1)
 HAVE_SHANI := $(shell grep -q sha_ni /proc/cpuinfo 2>/dev/null && echo 1)
 
 # SIMD compiler flags
-SSE41_FLAGS = -msse4.1
-SHANI_FLAGS = -msse4.1 -msha
+SSE41_FLAGS =
+SHANI_FLAGS =
 
 # Enable optimized implementations
-CRYPTO_DEFS = -DENABLE_SSE41 -DENABLE_X86_SHANI
+CRYPTO_DEFS =
 
 # Debug flags (comment out for release)
 # DEBUGFLAGS = -g -D__WXDEBUG__
