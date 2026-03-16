@@ -149,7 +149,7 @@ CRYPTO_DEFS = -DENABLE_SSE41 -DENABLE_X86_SHANI
 # Headers
 HEADERS = headers.h strlcpy.h serialize.h uint256.h util.h key.h bignum.h base58.h \
     script.h bitcoin_db.h db_cxx_compat.h net.h irc.h main.h rpc.h uibase.h ui.h init.h sha.h \
-    yespower.h yespower_hash.h sysendian.h bloom.h merkleblock.h stealth.h
+    yespower.h yespower_hash.h sysendian.h bloom.h merkleblock.h stealth.h atom.h
 
 # Crypto object files (optimized SHA256)
 OBJS_CRYPTO = \
@@ -175,6 +175,7 @@ OBJS_GUI = \
     obj/gui/ui.o \
     obj/gui/uibase.o \
     obj/gui/stealth.o \
+    obj/gui/atom.o \
     obj/sha.o \
     $(OBJS_CRYPTO) \
     $(OBJS_YESPOWER)
@@ -190,6 +191,7 @@ OBJS_DAEMON = \
     obj/nogui/rpc.o \
     obj/nogui/init.o \
     obj/nogui/stealth.o \
+    obj/nogui/atom.o \
     obj/sha.o \
     $(OBJS_CRYPTO) \
     $(OBJS_YESPOWER)

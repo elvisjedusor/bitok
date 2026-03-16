@@ -3,6 +3,7 @@
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
 
 class CTransaction;
+class CTxDB;
 
 enum
 {
@@ -14,8 +15,8 @@ enum
 
 enum
 {
-    SCRIPT_VERIFY_NONE      = 0,
-    SCRIPT_VERIFY_EXEC    = (1U << 0),
+    SCRIPT_VERIFY_NONE           = 0,
+    SCRIPT_VERIFY_EXEC           = (1U << 0),
 };
 
 static const unsigned int MAX_SCRIPT_SIZE = 10000;
@@ -182,7 +183,6 @@ enum opcodetype
     OP_CHECKMULTISIG,
     OP_CHECKMULTISIGVERIFY,
 
-
     // multi-byte opcodes
     OP_SINGLEBYTE_END = 0xF0,
     OP_DOUBLEBYTE_BEGIN = 0xF000,
@@ -322,9 +322,6 @@ inline const char* GetOpName(opcodetype opcode)
     case OP_CHECKSIGVERIFY         : return "OP_CHECKSIGVERIFY";
     case OP_CHECKMULTISIG          : return "OP_CHECKMULTISIG";
     case OP_CHECKMULTISIGVERIFY    : return "OP_CHECKMULTISIGVERIFY";
-
-
-
     // multi-byte opcodes
     case OP_SINGLEBYTE_END         : return "OP_SINGLEBYTE_END";
     case OP_DOUBLEBYTE_BEGIN       : return "OP_DOUBLEBYTE_BEGIN";

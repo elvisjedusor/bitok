@@ -103,6 +103,7 @@ int64 GetNetworkHashPS(int lookup = 30);
 bool ProcessBlock(CNode* pfrom, CBlock* pblock);
 double ComputePriority(const CTransaction& tx, CTxDB& txdb, int nHeight);
 bool ReindexUTXOs();
+bool RescanAtom(boost::function<bool (int, int)> progressCallback = 0);
 
 
 

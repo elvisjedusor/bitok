@@ -5,10 +5,22 @@
 #include "headers.h"
 #include "crypto/sha256.h"
 #include "yespower_dispatch.h"
+#if wxUSE_GUI
+#include <wx/progdlg.h>
+#endif
 
 extern void InitSHA256();
 
-
+#if wxUSE_GUI
+static bool AtomStartupProgressCallback(wxProgressDialog* dlg, int nScanned, int nTotal)
+{
+    int pct = (nTotal > 0) ? (nScanned * 100 / nTotal) : 0;
+    if (pct > 100) pct = 100;
+    dlg->Update(pct, wxString::Format(_("Scanned %d / %d blocks"), nScanned, nTotal));
+    wxSafeYield(dlg);
+    return true;
+}
+#endif
 
 
 void ExitTimeout(void* parg)
@@ -578,6 +590,31 @@ bool CMyApp::OnInit2()
         }
     }
 
+    {
+        CTxDB txdb("r");
+        int64 nAtomMinted = 0;
+        bool fHasAtomData = txdb.ReadAtomTotalMinted(nAtomMinted);
+        txdb.Close();
+        if (!fHasAtomData && nBestHeight > 0)
+        {
+            printf("[ATOM] No ATOM index found in database, running automatic ATOM rescan...\n");
+            nStart = GetTimeMillis();
+#if wxUSE_GUI
+            wxProgressDialog atomDlg(
+                _("Building ATOM Index"),
+                _("Scanning blockchain for ATOM data..."),
+                100,
+                NULL,
+                wxPD_APP_MODAL | wxPD_AUTO_HIDE | wxPD_SMOOTH | wxPD_ELAPSED_TIME | wxPD_ESTIMATED_TIME);
+            RescanAtom(boost::bind(AtomStartupProgressCallback, &atomDlg, _1, _2));
+            atomDlg.Update(100);
+#else
+            RescanAtom();
+#endif
+            printf(" atom rescan %15" PRI64d "ms\n", GetTimeMillis() - nStart);
+        }
+    }
+
     printf("Done loading\n");
 
         //// debug print
@@ -1064,6 +1101,36 @@ bool AppInit(int argc, char* argv[])
             CWalletDB().WriteSetting("nLimitProcessors", nLimitProcessors);
             printf("Initialized nLimitProcessors to %d (leaving 1 core for system)\n", nLimitProcessors);
         }
+    }
+
+    {
+        CTxDB txdb("r");
+        int64 nAtomMinted = 0;
+        bool fHasAtomData = txdb.ReadAtomTotalMinted(nAtomMinted);
+        txdb.Close();
+        if (!fHasAtomData && nBestHeight > 0)
+        {
+            printf("[ATOM] No ATOM index found in database, running automatic ATOM rescan...\n");
+            if (!RescanAtom())
+            {
+                fprintf(stderr, "Error building ATOM indexes\n");
+                return false;
+            }
+            printf("[ATOM] Automatic ATOM rescan completed\n");
+        }
+    }
+
+    {
+        CTxDB txdb("r");
+        std::map<uint256, CDexOrderEntry> orders;
+        txdb.LoadAllDexOrders(orders);
+        txdb.Close();
+        CRITICAL_BLOCK(cs_mapDexOrders)
+        {
+            mapDexOrders = orders;
+        }
+        if (!orders.empty())
+            printf("[DEX] Loaded %u open orders from database\n", (unsigned int)orders.size());
     }
 
     printf("Done loading\n");

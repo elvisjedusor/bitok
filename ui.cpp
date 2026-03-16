@@ -22,6 +22,15 @@ static bool RescanProgressCallback(wxProgressDialog* dlg, int nScanned, int nTot
     return true;
 }
 
+static bool AtomRescanProgressCallback(wxProgressDialog* dlg, int nScanned, int nTotal)
+{
+    int pct = (nTotal > 0) ? (nScanned * 100 / nTotal) : 0;
+    if (pct > 100) pct = 100;
+    dlg->Update(pct, wxString::Format(_("ATOM rescan: %d / %d blocks"), nScanned, nTotal));
+    wxSafeYield(dlg);
+    return true;
+}
+
 #if wxCHECK_VERSION(3, 0, 0)
 wxDEFINE_EVENT(wxEVT_UITHREADCALL, wxCommandEvent);
 #else
@@ -1481,6 +1490,17 @@ static bool ImportOkAddressSecret(wxWindow* parent, const string& strSecret, con
                 _("Import ok-Address"), wxOK | wxICON_INFORMATION);
     }
 
+    {
+        wxProgressDialog atomDlg(
+            _("Rebuilding ATOM Index"),
+            _("Rescanning ATOM balances and transactions..."),
+            100,
+            parent,
+            wxPD_APP_MODAL | wxPD_AUTO_HIDE | wxPD_SMOOTH | wxPD_ELAPSED_TIME | wxPD_ESTIMATED_TIME);
+        RescanAtom(bind(AtomRescanProgressCallback, &atomDlg, _1, _2));
+        atomDlg.Update(100);
+    }
+
     return true;
 }
 
@@ -1574,6 +1594,17 @@ void CMainFrame::OnButtonNew(wxCommandEvent& event)
             if (nFound > 0)
                 wxMessageBox(strprintf(_("Rescan complete. Found %d transaction(s).").mb_str(), nFound),
                     _("Import Private Key"), wxOK | wxICON_INFORMATION);
+        }
+
+        {
+            wxProgressDialog atomDlg(
+                _("Rebuilding ATOM Index"),
+                _("Rescanning ATOM balances and transactions..."),
+                100,
+                this,
+                wxPD_APP_MODAL | wxPD_AUTO_HIDE | wxPD_SMOOTH | wxPD_ELAPSED_TIME | wxPD_ESTIMATED_TIME);
+            RescanAtom(bind(AtomRescanProgressCallback, &atomDlg, _1, _2));
+            atomDlg.Update(100);
         }
 
         SetAddressBookName(strAddress, strName);
@@ -3287,6 +3318,17 @@ void CAddressBookDialog::OnButtonNew(wxCommandEvent& event)
                 if (nFound > 0)
                     wxMessageBox(strprintf(_("Rescan complete. Found %d transaction(s).").mb_str(), nFound),
                         _("Import Private Key"), wxOK | wxICON_INFORMATION);
+            }
+
+            {
+                wxProgressDialog atomDlg(
+                    _("Rebuilding ATOM Index"),
+                    _("Rescanning ATOM balances and transactions..."),
+                    100,
+                    this,
+                    wxPD_APP_MODAL | wxPD_AUTO_HIDE | wxPD_SMOOTH | wxPD_ELAPSED_TIME | wxPD_ESTIMATED_TIME);
+                RescanAtom(bind(AtomRescanProgressCallback, &atomDlg, _1, _2));
+                atomDlg.Update(100);
             }
         }
     }

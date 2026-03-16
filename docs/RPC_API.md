@@ -22,8 +22,10 @@ JSON-RPC 1.0 interface. Run `./bitokd help` to list all commands from the runnin
 14. [SPV / Merkle Proof Operations](#spv--merkle-proof-operations)
 15. [Key Management](#key-management)
 16. [Stealth Address Operations](#stealth-address-operations)
-17. [Error Handling](#error-handling)
-18. [Client Examples](#client-examples)
+17. [ATOM Operations](#atom-operations)
+18. [DEX Operations](#dex-operations)
+19. [Error Handling](#error-handling)
+20. [Client Examples](#client-examples)
 
 ---
 
@@ -287,14 +289,21 @@ List received amounts grouped by label.
 
 ### rescanwallet
 
-Rescan the blockchain to find wallet transactions. Use after importing a private key.
+Rescan the blockchain for wallet transactions and rebuild all ATOM state. Finds any transactions belonging to wallet keys that may be missing, then erases and rebuilds all ATOM balances and transaction history by replaying every block from genesis.
 
 **Parameters:** None
 
-**Returns:** null (runs in background, logs progress)
+**Returns:**
+- `found` — number of wallet transactions found during rescan
 
 ```bash
 ./bitokd rescanwallet
+```
+
+```json
+{
+  "found": 42
+}
 ```
 
 ---
@@ -1326,6 +1335,688 @@ Decode a stealth address and show its component public keys. Works for any steal
 ```
 
 Public keys are returned in compressed format.
+
+---
+
+## ATOM Operations
+
+ATOM is a native token layer built directly on the Bitok blockchain. ATOM state (balances, transaction history) is maintained by every full node. On startup, if no ATOM index is found in the database, a full rescan runs automatically. Use `rescanwallet` to force a manual rebuild.
+
+See [ATOM.md](ATOM.md) for the full protocol specification.
+
+### getatominfo
+
+Returns ATOM protocol parameters and live mempool statistics.
+
+**Parameters:** None
+
+**Returns:**
+- `name` — "ATOM"
+- `version` — protocol version (1)
+- `decimals` — decimal places (6)
+- `decimals_unit` — base units per 1 ATOM (1000000)
+- `max_supply` — maximum supply in ATOM units (1000000000.0)
+- `max_supply_raw` — maximum supply in base units
+- `payload_size` — standard payload size in bytes (58)
+- `activation_height` — block height ATOM activates (25000)
+- `max_nonce_gap` — maximum allowed nonce gap (100)
+- `finality` — "confirmed"
+- `pending_txs` — number of ATOM transactions currently in the mempool
+
+```bash
+./bitokd getatominfo
+```
+
+```json
+{
+  "name": "ATOM",
+  "version": 1,
+  "decimals": 6,
+  "decimals_unit": 1000000,
+  "max_supply": 1000000000.0,
+  "max_supply_raw": 1000000000000000,
+  "payload_size": 58,
+  "activation_height": 25000,
+  "max_nonce_gap": 100,
+  "finality": "confirmed",
+  "pending_txs": 3
+}
+```
+
+---
+
+### gettotalatomsupply
+
+Returns the total circulating ATOM supply — the sum of all confirmed ATOM balances on-chain.
+
+**Parameters:** None
+
+**Returns:**
+- `total_supply` — circulating supply in ATOM units (6 decimal places)
+- `total_supply_raw` — circulating supply in base units
+- `max_supply` — protocol cap in ATOM units
+- `max_supply_raw` — protocol cap in base units
+- `decimals` — decimal places (6)
+
+```bash
+./bitokd gettotalatomsupply
+```
+
+```json
+{
+  "total_supply": 42000000.500000,
+  "total_supply_raw": 42000000500000,
+  "max_supply": 1000000000.000000,
+  "max_supply_raw": 1000000000000000,
+  "decimals": 6
+}
+```
+
+Only confirmed (mined) balances are counted. Pending mempool transfers do not affect the result.
+
+---
+
+### getatombalance
+
+Returns the wallet's total confirmed ATOM balance across all addresses in `wallet.dat`.
+
+**Parameters:** None
+
+**Returns:** Number (double) — total ATOM balance
+
+```bash
+./bitokd getatombalance
+```
+
+```
+95.5
+```
+
+Pending amounts are not included. Returns a plain number, not a JSON object.
+
+---
+
+### getaddressatombalance
+
+Returns the confirmed ATOM balance for a specific address. **Requires `-indexer`.**
+
+**Parameters:**
+1. `address` (string, required) — Bitok address
+
+**Returns:** Number (double) — confirmed ATOM balance
+
+```bash
+./bitokd getaddressatombalance "1ExampleAddressXXXX"
+```
+
+```
+95.5
+```
+
+---
+
+### getnextatomnonce
+
+Returns the next valid ATOM nonce for an address. Accounts for both the confirmed DB nonce and any pending mempool transactions.
+
+**Parameters:**
+1. `address` (string, required) — Bitok address
+
+**Returns:**
+- `address` — the queried address
+- `confirmed_nonce` — last nonce written to the database
+- `next_nonce` — safe nonce to use: `max(confirmed_nonce, highest_mempool_nonce) + 1`
+
+```bash
+./bitokd getnextatomnonce "1ExampleAddressXXXX"
+```
+
+```json
+{
+  "address": "1ExampleAddressXXXX",
+  "confirmed_nonce": 7,
+  "next_nonce": 8
+}
+```
+
+---
+
+### getatomtx
+
+Look up an ATOM transfer by its Bitok transaction ID. Checks the mempool first (status `"pending"`), then the confirmed database (status `"mined"`).
+
+**Parameters:**
+1. `txid` (string, required) — transaction ID hex
+
+**Returns:**
+- `txid` — transaction ID
+- `type` — `"transfer"`, `"bridge_to_sol"`, `"bridge_to_bitok"`, or `"coinbase"`
+- `status` — `"pending"` (mempool) or `"mined"` (confirmed)
+- `from` — sender address
+- `to` — recipient address (absent for `bridge_to_sol`)
+- `solana_destination` — Solana address in Base58 (only for `bridge_to_sol`)
+- `amount` — ATOM amount
+- `amount_raw` — amount in base units
+- `nonce` — sender's nonce
+- `height` — block height (mined only)
+- `time` — block Unix timestamp (mined only)
+
+```bash
+./bitokd getatomtx "a1b2c3d4..."
+```
+
+**Pending (mempool) response:**
+
+```json
+{
+  "txid": "a1b2c3d4...",
+  "type": "transfer",
+  "status": "pending",
+  "from": "1SenderAddr...",
+  "to": "1RecipientAddr...",
+  "amount": 1.5,
+  "amount_raw": 1500000,
+  "nonce": 8
+}
+```
+
+**Mined response:**
+
+```json
+{
+  "txid": "a1b2c3d4...",
+  "type": "transfer",
+  "status": "mined",
+  "height": 100230,
+  "time": 1710000000,
+  "from": "1SenderAddr...",
+  "to": "1RecipientAddr...",
+  "amount": 1.5,
+  "amount_raw": 1500000,
+  "nonce": 8
+}
+```
+
+---
+
+### getatomhistory
+
+Returns ATOM transactions involving an address, newest first. **Requires `-indexer`.** Mempool entries appear before mined entries. A transaction is deduplicated if it appears in both mempool and confirmed state.
+
+**Parameters:**
+1. `address` (string, required) — Bitok address
+2. `count` (integer, optional, default: 50) — maximum entries to return
+
+**Returns:** Array of transaction objects:
+- `txid` — transaction ID
+- `type` — `"transfer"`, `"bridge_to_sol"`, `"bridge_to_bitok"`, or `"coinbase"`
+- `status` — `"pending"` or `"mined"`
+- `direction` — `"sent"`, `"received"`, `"self"`, `"bridge_to_sol"`, `"bridge_to_bitok"`, or `"coinbase"`
+- `from` — sender address
+- `to` — recipient address (absent for `bridge_to_sol`)
+- `solana_destination` — Solana address in Base58 (only for `bridge_to_sol`)
+- `amount` — ATOM amount
+- `amount_raw` — amount in base units
+- `nonce` — sender's nonce
+- `height` — block height (mined only)
+- `time` — block Unix timestamp (mined only)
+
+```bash
+./bitokd getatomhistory "1ExampleAddressXXXX" 20
+```
+
+```json
+[
+  {
+    "txid": "...",
+    "type": "transfer",
+    "status": "pending",
+    "direction": "received",
+    "from": "1SenderAddr...",
+    "to": "1ExampleAddressXXXX",
+    "amount": 10.0,
+    "amount_raw": 10000000,
+    "nonce": 1
+  },
+  {
+    "txid": "...",
+    "type": "coinbase",
+    "status": "mined",
+    "direction": "coinbase",
+    "height": 100230,
+    "time": 1710000000,
+    "from": "",
+    "to": "1ExampleAddressXXXX",
+    "amount": 1000.0,
+    "amount_raw": 1000000000,
+    "nonce": 0
+  }
+]
+```
+
+---
+
+### listatomtransactions
+
+Returns ATOM transactions involving any address in the local wallet, newest first. Does **not** require `-indexer`. Mempool entries appear first, then mined entries sorted by time.
+
+**Parameters:**
+1. `count` (integer, optional, default: 50) — maximum entries to return
+
+**Returns:** Array of transaction objects (same fields as `getatomhistory`)
+
+```bash
+./bitokd listatomtransactions 20
+```
+
+```json
+[
+  {
+    "txid": "a1b2c3d4...",
+    "type": "transfer",
+    "status": "pending",
+    "direction": "received",
+    "from": "1SenderAddr...",
+    "to": "1WalletAddr...",
+    "amount": 10.0,
+    "amount_raw": 10000000,
+    "nonce": 1
+  },
+  {
+    "txid": "b2c3d4e5...",
+    "type": "transfer",
+    "status": "mined",
+    "direction": "sent",
+    "height": 100230,
+    "time": 1710000000,
+    "from": "1WalletAddr...",
+    "to": "1RecipientAddr...",
+    "amount": 5.0,
+    "amount_raw": 5000000,
+    "nonce": 2
+  }
+]
+```
+
+---
+
+### sendatom
+
+Send ATOM to an address using the local wallet. Funds are drawn from all wallet addresses with ATOM balance, sorted largest-first. If a single address covers the amount, one transaction is broadcast. Otherwise multiple transactions are chained automatically.
+
+**Parameters:**
+1. `toaddress` (string, required) — recipient Bitok address
+2. `amount` (number, required) — amount in ATOM units (e.g. `1.5` = 1.5 ATOM)
+
+**Returns (single transaction):**
+- `txid` — transaction ID
+- `from` — sending address
+- `to` — recipient address
+- `amount` — ATOM amount sent
+- `amount_raw` — amount in base units
+- `status` — `"pending"`
+
+**Returns (multiple transactions):**
+- `txids` — array of transaction IDs
+- `to` — recipient address
+- `amount` — total ATOM amount sent
+- `amount_raw` — total amount in base units
+- `tx_count` — number of transactions
+- `status` — `"pending"`
+
+```bash
+./bitokd sendatom "1RecipientAddr..." 1.5
+```
+
+```json
+{
+  "txid": "a1b2c3d4...",
+  "from": "1WalletAddr...",
+  "to": "1RecipientAddr...",
+  "amount": 1.5,
+  "amount_raw": 1500000,
+  "status": "pending"
+}
+```
+
+A small Bitok fee is required per transaction from the wallet's coin balance.
+
+---
+
+### createatomrawtx
+
+Build an unsigned raw transaction carrying an ATOM transfer in its OP_RETURN output. Intended for web wallets and applications that manage keys outside of `wallet.dat`.
+
+**Parameters:**
+1. `fromaddress` (string, required) — sender's Bitok address (HASH160 embedded in ATOM payload)
+2. `toaddress` (string, required) — recipient's Bitok address
+3. `amount` (number, required) — ATOM amount (e.g. `1.5`)
+4. `nonce` (integer, required) — per-sender counter from `getnextatomnonce`
+5. `inputs` (array, optional) — `[{"txid":"...","vout":N}]` UTXOs to fund the tx. If omitted, the tx has no inputs.
+
+**Returns:**
+- `hex` — unsigned transaction hex
+- `from` — sender address
+- `to` — recipient address
+- `amount` — ATOM amount
+- `amount_raw` — amount in base units
+- `nonce` — nonce used
+- `dust_out` — dust output value (0.01 BITOK)
+- `note` — instructions for signing and broadcasting
+
+```bash
+./bitokd createatomrawtx "1FromAddr..." "1ToAddr..." 1.5 8 '[{"txid":"abc...","vout":0}]'
+```
+
+```json
+{
+  "hex": "0100000001...",
+  "from": "1FromAddr...",
+  "to": "1ToAddr...",
+  "amount": 1.5,
+  "amount_raw": 1500000,
+  "nonce": 8,
+  "dust_out": 1000000,
+  "note": "Add coin inputs (listunspent), sign with signrawtransaction, broadcast with sendrawtransaction"
+}
+```
+
+The transaction has two outputs: a dust output (0.01 BITOK) to `toaddress` and an OP_RETURN output carrying the ATOM payload. Only builds TRANSFER payloads. Use `bridgeatomtosol` for bridge transactions.
+
+**Full web wallet workflow:**
+
+```
+1. getnextatomnonce <fromaddress>          -> confirmed_nonce, next_nonce
+2. listunspent  OR  getaddressutxos        -> select UTXOs covering dust + fee
+3. createatomrawtx <from> <to> <amt> <nonce> [inputs]  -> unsigned hex
+4. signrawtransaction <hex> [] ["WIF"]     -> signed hex, complete: true
+5. sendrawtransaction <signed_hex>         -> txid
+```
+
+---
+
+### bridgeatomtosol
+
+Bridge ATOM from the local wallet to a Solana address. Burns ATOM on the Bitok chain and signals the bridge daemon to mint equivalent SPL tokens on Solana.
+
+**Parameters:**
+1. `solana_address` (string, required) — Solana address in Base58 format
+2. `amount` (number, required) — amount in ATOM units (e.g. `10.0`)
+
+**Returns:**
+- `txid` — transaction ID
+- `from` — wallet address used
+- `solana_destination` — Solana address in Base58
+- `amount` — ATOM amount
+- `amount_raw` — amount in base units
+- `status` — `"pending"`
+
+```bash
+./bitokd bridgeatomtosol "6e5ZCp6V5ogM7o8bkJhcjzJSqJqbKMs4jAtSqDujDaxr" 10.0
+```
+
+```json
+{
+  "txid": "a1b2c3d4...",
+  "from": "1WalletAddr...",
+  "solana_destination": "6e5ZCp6V5ogM7o8bkJhcjzJSqJqbKMs4jAtSqDujDaxr",
+  "amount": 10.0,
+  "amount_raw": 10000000,
+  "status": "pending"
+}
+```
+
+No `to` field is returned — the ATOM is burned on Bitok, not sent to any Bitok address. Funds are drawn from the wallet address with the largest spendable ATOM balance.
+
+---
+
+## DEX Operations
+
+The built-in peer-to-peer exchange for trading ATOM against BITOK. Fully atomic, consensus-enforced settlement with no trusted intermediary. Active at block height 25000 (`ATOM_DEX_ACTIVATION_HEIGHT`).
+
+See [DEX.md](DEX.md) for the full protocol specification, wire formats, and settlement mechanics.
+
+---
+
+### dexsell
+
+Place a sell order. Your ATOM is escrowed on-chain when the transaction is mined and remains locked until the order is taken or cancelled.
+
+**Parameters:**
+1. `atom_amount` (number, required) — ATOM quantity to sell (e.g. `100.5`)
+2. `price` (number, required) — ask price in BITOK per 1 ATOM (e.g. `0.05`)
+
+**Behavior:**
+- Finds the wallet address with the highest spendable ATOM balance
+- Validates `atom_amount` is covered by available balance (confirmed minus pending transfers and existing DEX escrows)
+- Selects next nonce: `max(confirmedNonce+1, highestPendingNonce+1)`
+- Broadcasts a `DEX_OFFER` transaction (62-byte OP_RETURN payload)
+- ATOM is debited from the maker's account when the block is mined, not at broadcast
+
+**Returns:**
+```json
+{
+  "txid":        "abc123...",
+  "from":        "1MakerAddr...",
+  "atom_amount": 100.5,
+  "price":       0.05,
+  "total_bitok": 5.025,
+  "nonce":       7,
+  "status":      "pending"
+}
+```
+
+- `total_bitok` — BITOK a buyer will pay: `(atom_amount × price)`
+- `status` — always `"pending"` until mined
+
+```bash
+./bitokd dexsell 100.5 0.05
+```
+
+**Errors:** Invalid amount/price, no wallet addresses with ATOM, insufficient spendable ATOM, transaction creation failure.
+
+---
+
+### dexcancel
+
+Cancel an open sell order. The escrowed ATOM is returned to your account when the cancellation is mined.
+
+**Parameters:**
+1. `offer_txid` (string, required) — transaction ID of the `DEX_OFFER` to cancel
+
+**Behavior:**
+- Looks up the offer in the open order book (`mapDexOrders`)
+- Verifies a wallet key owns the order (maker address must match a wallet key)
+- Broadcasts a `DEX_CANCEL` transaction (58-byte OP_RETURN payload)
+- Rejected if a take or another cancel for this offer is already pending in the mempool
+
+**Returns:**
+```json
+{
+  "txid":      "abc123...",
+  "cancelled": "offer_txid...",
+  "status":    "pending"
+}
+```
+
+```bash
+./bitokd dexcancel "offer_txid..."
+```
+
+**Errors:** Offer not found, caller is not the maker, duplicate cancel/take already pending.
+
+---
+
+### dexbuy
+
+Buy ATOM from the cheapest available sell order. Automatically selects the best-priced matching order.
+
+**Parameters:**
+1. `atom_amount` (number, required) — minimum ATOM to buy. Use `0` to take the cheapest order regardless of size; if > 0 only orders with at least this amount are considered
+2. `max_price` (number, optional) — maximum price in BITOK per ATOM; orders above this are ignored
+
+**Order selection:**
+- Considers only `SELL_ATOM` orders
+- Skips orders with a pending take or cancel in the mempool
+- Selects cheapest (lowest price); ties broken by smallest order size
+
+**Behavior:**
+- Computes BITOK payment: `(order.atom_amount × order.price)`
+- Verifies wallet has sufficient BITOK
+- Broadcasts a `DEX_TAKE` transaction with a BITOK output to the maker's address
+- ATOM is credited to the taker when the block is mined
+
+**Returns:**
+```json
+{
+  "txid":          "abc123...",
+  "offer_taken":   "offer_txid...",
+  "taker":         "1TakerAddr...",
+  "atom_received": 100.5,
+  "bitok_paid":    5.025,
+  "price":         0.05,
+  "status":        "pending"
+}
+```
+
+```bash
+./bitokd dexbuy 100 0.06
+./bitokd dexbuy 0
+```
+
+**Errors:** Invalid parameters, no matching order found, insufficient BITOK, transaction creation failure.
+
+---
+
+### dextake
+
+Take a specific sell order by its transaction ID. Identical to `dexbuy` but targets an exact offer rather than finding the best price.
+
+**Parameters:**
+1. `offer_txid` (string, required) — transaction ID of the `DEX_OFFER` to fill
+
+**Behavior:**
+- Looks up the specific offer in `mapDexOrders`
+- Finds a wallet address that is not the maker
+- Verifies sufficient BITOK balance
+- Broadcasts `DEX_TAKE` transaction
+
+**Returns:** Same structure as `dexbuy`.
+
+```bash
+./bitokd dextake "offer_txid..."
+```
+
+**Errors:** Offer not found or already taken/cancelled, no suitable wallet address, insufficient BITOK.
+
+---
+
+### dexorderbook
+
+List all open sell orders, sorted by price ascending (cheapest first).
+
+**Parameters:** None
+
+**Returns:**
+```json
+{
+  "orders": [
+    {
+      "txid":        "abc123...",
+      "seller":      "1MakerAddr...",
+      "atom_amount": 100.0,
+      "price":       0.05,
+      "total_bitok": 5.0,
+      "height":      25100
+    },
+    {
+      "txid":        "def456...",
+      "seller":      "1OtherAddr...",
+      "atom_amount": 50.0,
+      "price":       0.06,
+      "total_bitok": 3.0,
+      "height":      25200
+    }
+  ],
+  "total_count": 2
+}
+```
+
+- `total_bitok` — BITOK cost to fill this order at its listed price
+- `height` — block height at which the offer was confirmed
+
+```bash
+./bitokd dexorderbook
+```
+
+Always succeeds; returns `total_count: 0` and empty array if no orders are open.
+
+---
+
+### dexmyorders
+
+List your own open sell orders. Only returns orders where the maker address matches a key in your wallet.
+
+**Parameters:** None
+
+**Returns:** Array of order objects:
+```json
+[
+  {
+    "txid":        "abc123...",
+    "address":     "1MakerAddr...",
+    "atom_amount": 100.0,
+    "price":       0.05,
+    "total_bitok": 5.0,
+    "height":      25100
+  }
+]
+```
+
+```bash
+./bitokd dexmyorders
+```
+
+Always succeeds; returns empty array if you have no open orders.
+
+---
+
+### dexinfo
+
+DEX statistics and current parameters.
+
+**Parameters:** None
+
+**Returns:**
+```json
+{
+  "activation_height":  25000,
+  "open_orders":        42,
+  "total_atom":         12345.5,
+  "total_bitok_value":  617.275,
+  "cheapest_ask":       0.045,
+  "pending_sells":      3,
+  "pending_cancels":    1,
+  "pending_buys":       2
+}
+```
+
+| Field | Description |
+|---|---|
+| `activation_height` | Block height DEX became active (always 25000) |
+| `open_orders` | Number of confirmed open sell orders |
+| `total_atom` | Sum of all escrowed ATOM across open orders |
+| `total_bitok_value` | Total BITOK value of all open orders at their listed prices |
+| `cheapest_ask` | Lowest price in BITOK/ATOM across all open orders; `null` if no orders |
+| `pending_sells` | `DEX_OFFER` transactions in mempool (unconfirmed) |
+| `pending_cancels` | `DEX_CANCEL` transactions in mempool |
+| `pending_buys` | `DEX_TAKE` transactions in mempool |
+
+```bash
+./bitokd dexinfo
+```
+
+Always succeeds.
 
 ---
 
