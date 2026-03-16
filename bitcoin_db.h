@@ -299,6 +299,30 @@ public:
     bool ReadAddrUTXOs(uint160 addr, vector<pair<COutPoint, pair<int64, pair<int, bool> > > >& vUTXOs);
     bool ReadAddrOut(uint160 addr, uint256 txhash, unsigned int n, int64& nValue, int& nHeight);
     bool EraseAllIndexerData();
+
+    // ATOM layer
+    bool WriteAtomBalance(uint160 addr, int64 nBalance, uint32_t nNonce);
+    bool ReadAtomBalance(uint160 addr, int64& nBalance, uint32_t& nNonce);
+    bool ReadAtomBalance(uint160 addr, int64& nBalance, uint32_t& nNonce, bool& fDbError);
+    bool EraseAtomBalance(uint160 addr);
+    bool SumAllAtomBalances(int64& nTotalOut);
+
+    bool WriteAtomTx(uint256 txhash, int nHeight, unsigned int nTime, unsigned char nType,
+                     uint160 addrFrom, uint160 addrTo, int64 nAmount, uint32_t nNonce,
+                     const unsigned char* pSolAddrTo = NULL);
+    bool ReadAtomTx(uint256 txhash, int& nHeight, unsigned int& nTime, unsigned char& nType,
+                    uint160& addrFrom, uint160& addrTo, int64& nAmount, uint32_t& nNonce,
+                    unsigned char* pSolAddrTo = NULL);
+    bool EraseAtomTx(uint256 txhash);
+
+    bool ReadAtomAddrTxids(uint160 addr, vector<uint256>& vtxids);
+    bool WriteAtomAddrTx(uint160 addr, uint256 txhash, int nHeight);
+    bool EraseAtomAddrTx(uint160 addr, uint256 txhash);
+
+    bool EraseAllAtomData();
+
+    bool WriteAtomTotalMinted(int64 nTotal);
+    bool ReadAtomTotalMinted(int64& nTotal);
 };
 
 

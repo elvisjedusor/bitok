@@ -1,4 +1,4 @@
-// Copyright (c) 2024 Bitok Developers
+// Copyright (c) 2026 Bitok Developers
 // Stealth address implementation - Satoshi's "key blinding" brought to life
 
 #include "headers.h"

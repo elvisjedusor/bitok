@@ -3,6 +3,7 @@
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
 
 #include "headers.h"
+#include "atom.h"
 #undef printf
 #undef snprintf
 #ifdef _WIN32
@@ -13,6 +14,7 @@
 #include "json/json_spirit_writer_template.h"
 #include "json/json_spirit_utils.h"
 #define printf OutputDebugStringF
+static string SolAddrToBase58(const unsigned char* p);
 // MinGW 3.4.5 gets "fatal error: had to relocate PCH" if the json headers are
 // precompiled in headers.h.  The problem might be when the pch file goes over
 // a certain size around 145MB.  If we need access to json_spirit outside this
@@ -2025,6 +2027,7 @@ Value importprivkey(const Array& params, bool fHelp)
 
             printf("[STEALTH] Re-scanning to pick up change transactions\n");
             ScanWalletTransactions(pindexGenesisBlock);
+            RescanAtom();
         }
 
         Object result;
@@ -2059,6 +2062,7 @@ Value importprivkey(const Array& params, bool fHelp)
     {
         printf("[WALLET] Rescanning blockchain for imported key %s\n", strAddress.c_str());
         ScanWalletTransactions(pindexGenesisBlock);
+        RescanAtom();
     }
 
     return strAddress;
@@ -2070,11 +2074,14 @@ Value rescanwallet(const Array& params, bool fHelp)
     if (fHelp || params.size() > 0)
         throw runtime_error(
             "rescanwallet\n"
-            "Rescans the blockchain for wallet transactions.\n"
-            "This finds any transactions belonging to wallet keys that may be missing from the wallet.");
+            "Rescans the blockchain for wallet transactions and rebuilds all ATOM state.\n"
+            "This finds any transactions belonging to wallet keys that may be missing\n"
+            "from the wallet, then erases and rebuilds all ATOM balances and transaction\n"
+            "history by replaying every block from genesis.");
 
     printf("[WALLET] Rescanning blockchain for all wallet transactions\n");
     int nFound = ScanWalletTransactions(pindexGenesisBlock);
+    RescanAtom();
 
     Object result;
     result.push_back(Pair("found", nFound));
@@ -4190,6 +4197,991 @@ Value decodestealthaddress(const Array& params, bool fHelp)
 }
 
 
+// ---------------------------------------------------------------------------
+// ATOM RPC commands
+// ---------------------------------------------------------------------------
+
+static inline double AtomToDouble(int64 nRaw)
+{
+    double v = (double)nRaw / (double)ATOM_DECIMALS;
+    return floor(v * 1e6 + 0.5) / 1e6;
+}
+
+static Object GetAtomBalanceForHash160(const uint160& hash160, const string& strAddress)
+{
+    CTxDB txdb("r");
+    int64 nConfirmed = 0;
+    uint32_t nNonceIgnored = 0;
+    txdb.ReadAtomBalance(hash160, nConfirmed, nNonceIgnored);
+    txdb.Close();
+
+    int64 nPendingIn  = 0;
+    int64 nPendingOut = 0;
+    CRITICAL_BLOCK(cs_mapAtomMempool)
+    {
+        for (std::map<uint256, CAtomTransfer>::iterator it = mapAtomMempoolTx.begin();
+             it != mapAtomMempoolTx.end(); ++it)
+        {
+            const CAtomTransfer& t = it->second;
+            if (t.nType == ATOM_TYPE_TRANSFER)
+            {
+                if (t.addrTo   == hash160) nPendingIn  += t.nAmount;
+                if (t.addrFrom == hash160) nPendingOut += t.nAmount;
+            }
+            else if (t.nType == ATOM_TYPE_BRIDGE_TO_SOL)
+            {
+                if (t.addrFrom == hash160) nPendingOut += t.nAmount;
+            }
+        }
+    }
+
+    int64 nSpendable = nConfirmed - nPendingOut;
+    if (nSpendable < 0) nSpendable = 0;
+
+    Object result;
+    result.push_back(Pair("address",          strAddress));
+    result.push_back(Pair("balance",     AtomToDouble(nConfirmed)));
+    result.push_back(Pair("spendable",   AtomToDouble(nSpendable)));
+    result.push_back(Pair("pending_in",  AtomToDouble(nPendingIn)));
+    result.push_back(Pair("pending_out", AtomToDouble(nPendingOut)));
+    return result;
+}
+
+Value getatombalance(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 0)
+        throw runtime_error(
+            "getatombalance\n"
+            "Returns the wallet's total confirmed ATOM balance.");
+
+    int64 nTotal = 0;
+    CTxDB txdb("r");
+
+    CRITICAL_BLOCK(cs_mapKeys)
+    {
+        for (map<uint160, vector<unsigned char> >::iterator it = mapPubKeys.begin();
+             it != mapPubKeys.end(); ++it)
+        {
+            const uint160& hash160 = it->first;
+            int64 nConfirmed = 0;
+            uint32_t nNonceIgnored = 0;
+            txdb.ReadAtomBalance(hash160, nConfirmed, nNonceIgnored);
+            nTotal += nConfirmed;
+        }
+    }
+
+    txdb.Close();
+    return AtomToDouble(nTotal);
+}
+
+
+Value getaddressatombalance(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 1)
+        throw runtime_error(
+            "getaddressatombalance <address>\n"
+            "Returns the confirmed ATOM balance of <address>. Requires -indexer.");
+
+    if (!fUseIndexer)
+        throw runtime_error("getaddressatombalance requires node started with -indexer flag");
+
+    string strAddress = params[0].get_str();
+    uint160 hash160;
+    if (!AddressToHash160(strAddress, hash160))
+        throw runtime_error("Invalid Bitok address");
+
+    CTxDB txdb("r");
+    int64 nConfirmed = 0;
+    uint32_t nNonceIgnored = 0;
+    txdb.ReadAtomBalance(hash160, nConfirmed, nNonceIgnored);
+    txdb.Close();
+
+    return AtomToDouble(nConfirmed);
+}
+
+
+Value getatomtx(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 1)
+        throw runtime_error(
+            "getatomtx <txid>\n"
+            "Returns ATOM transfer data for a transaction.\n"
+            "Finds the tx in the mempool (status=accepted) or confirmed blocks (status=mined).");
+
+    string strTxid = params[0].get_str();
+    uint256 txhash;
+    txhash.SetHex(strTxid);
+
+    // Check mempool first
+    {
+        CRITICAL_BLOCK(cs_mapAtomMempool)
+        {
+            std::map<uint256, CAtomTransfer>::iterator it = mapAtomMempoolTx.find(txhash);
+            if (it != mapAtomMempoolTx.end())
+            {
+                const CAtomTransfer& t = it->second;
+                string strType;
+                if (t.nType == ATOM_TYPE_TRANSFER) strType = "transfer";
+                else if (t.nType == ATOM_TYPE_BRIDGE_TO_SOL) strType = "bridge_to_sol";
+                else if (t.nType == ATOM_TYPE_BRIDGE_TO_BITOK) strType = "bridge_to_bitok";
+                else if (t.nType == ATOM_TYPE_COINBASE) strType = "coinbase";
+                else strType = "unknown";
+
+                Object result;
+                result.push_back(Pair("txid",       txhash.ToString()));
+                result.push_back(Pair("type",       strType));
+                result.push_back(Pair("status",     string("pending")));
+                result.push_back(Pair("from",       Hash160ToAddress(t.addrFrom)));
+                if (t.nType == ATOM_TYPE_BRIDGE_TO_SOL)
+                    result.push_back(Pair("solana_destination", SolAddrToBase58(t.solAddrTo)));
+                else
+                    result.push_back(Pair("to",     Hash160ToAddress(t.addrTo)));
+                result.push_back(Pair("amount",     AtomToDouble(t.nAmount)));
+                result.push_back(Pair("amount_raw", (int64_t)t.nAmount));
+                result.push_back(Pair("nonce",      (int64_t)t.nNonce));
+                return result;
+            }
+        }
+    }
+
+    // Fall back to confirmed DB
+    CTxDB txdb("r");
+    int nHeight = 0;
+    unsigned int nTime = 0;
+    unsigned char nType = 0;
+    uint160 addrFrom(0), addrTo(0);
+    int64 nAmount = 0;
+    uint32_t nNonce = 0;
+    unsigned char solAddrTo[32] = {0};
+
+    if (!txdb.ReadAtomTx(txhash, nHeight, nTime, nType, addrFrom, addrTo, nAmount, nNonce, solAddrTo))
+        throw runtime_error("ATOM transfer not found for txid: " + strTxid);
+    txdb.Close();
+
+    string strType;
+    if (nType == ATOM_TYPE_TRANSFER) strType = "transfer";
+    else if (nType == ATOM_TYPE_BRIDGE_TO_SOL) strType = "bridge_to_sol";
+    else if (nType == ATOM_TYPE_BRIDGE_TO_BITOK) strType = "bridge_to_bitok";
+    else if (nType == ATOM_TYPE_COINBASE) strType = "coinbase";
+    else strType = "unknown";
+
+    Object result;
+    result.push_back(Pair("txid",       txhash.ToString()));
+    result.push_back(Pair("type",       strType));
+    result.push_back(Pair("status",     string("mined")));
+    result.push_back(Pair("height",     nHeight));
+    result.push_back(Pair("time",       (int64_t)nTime));
+    result.push_back(Pair("from",       Hash160ToAddress(addrFrom)));
+    if (nType == ATOM_TYPE_BRIDGE_TO_SOL)
+    {
+        result.push_back(Pair("solana_destination", SolAddrToBase58(solAddrTo)));
+    }
+    else
+    {
+        result.push_back(Pair("to",     Hash160ToAddress(addrTo)));
+    }
+    result.push_back(Pair("amount",     AtomToDouble(nAmount)));
+    result.push_back(Pair("amount_raw", (int64_t)nAmount));
+    result.push_back(Pair("nonce",      (int64_t)nNonce));
+    return result;
+}
+
+
+Value getatomhistory(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() < 1 || params.size() > 2)
+        throw runtime_error(
+            "getatomhistory <address> [count=50]\n"
+            "Returns ATOM transactions involving <address>, newest first.\n"
+            "Includes both mempool (status=pending) and mined (status=mined) transactions.\n"
+            "Requires -indexer.");
+
+    if (!fUseIndexer)
+        throw runtime_error("getatomhistory requires node started with -indexer flag");
+
+    string strAddress = params[0].get_str();
+    int nCount = 50;
+    if (params.size() > 1)
+        nCount = params[1].get_int();
+
+    uint160 hash160;
+    if (!AddressToHash160(strAddress, hash160))
+        throw runtime_error("Invalid Bitok address");
+
+    Array ret;
+
+    // Collect mempool txids for this address and emit them first.
+    // Also build a set for dedup — a tx that was just mined may still linger in the mempool
+    // index for a brief window and would appear in both sections without this guard.
+    std::set<uint256> setMempool;
+    CRITICAL_BLOCK(cs_mapAtomMempool)
+    {
+        for (std::map<uint256, CAtomTransfer>::iterator it = mapAtomMempoolTx.begin();
+             it != mapAtomMempoolTx.end(); ++it)
+        {
+            const CAtomTransfer& t = it->second;
+            if (t.addrFrom != hash160 && t.addrTo != hash160)
+                continue;
+
+            setMempool.insert(it->first);
+
+            string strType;
+            if (t.nType == ATOM_TYPE_TRANSFER) strType = "transfer";
+            else if (t.nType == ATOM_TYPE_BRIDGE_TO_SOL) strType = "bridge_to_sol";
+            else if (t.nType == ATOM_TYPE_BRIDGE_TO_BITOK) strType = "bridge_to_bitok";
+            else if (t.nType == ATOM_TYPE_COINBASE) strType = "coinbase";
+            else strType = "unknown";
+
+            string strDir;
+            if (t.nType == ATOM_TYPE_BRIDGE_TO_SOL)
+                strDir = "bridge_to_sol";
+            else if (t.nType == ATOM_TYPE_BRIDGE_TO_BITOK)
+                strDir = "bridge_to_bitok";
+            else if (t.nType == ATOM_TYPE_COINBASE)
+                strDir = "coinbase";
+            else
+                strDir = (t.addrTo == hash160) ? "received" : "sent";
+
+            Object entry;
+            entry.push_back(Pair("txid",      it->first.ToString()));
+            entry.push_back(Pair("type",      strType));
+            entry.push_back(Pair("status",    string("pending")));
+            entry.push_back(Pair("direction", strDir));
+            entry.push_back(Pair("from",      Hash160ToAddress(t.addrFrom)));
+            if (t.nType == ATOM_TYPE_BRIDGE_TO_SOL)
+                entry.push_back(Pair("solana_destination", SolAddrToBase58(t.solAddrTo)));
+            else
+                entry.push_back(Pair("to",    Hash160ToAddress(t.addrTo)));
+            entry.push_back(Pair("amount",    AtomToDouble(t.nAmount)));
+            entry.push_back(Pair("amount_raw",(int64_t)t.nAmount));
+            entry.push_back(Pair("nonce",     (int64_t)t.nNonce));
+            ret.push_back(entry);
+        }
+    }
+
+    CTxDB txdb("r");
+    vector<uint256> vtxids;
+    txdb.ReadAtomAddrTxids(hash160, vtxids);
+
+    int nStart = (int)vtxids.size() - nCount;
+    if (nStart < 0) nStart = 0;
+
+    for (int i = (int)vtxids.size() - 1; i >= nStart; i--)
+    {
+        const uint256& txhash = vtxids[i];
+
+        if (setMempool.count(txhash))
+            continue;
+
+        int nHeight = 0;
+        unsigned int nTime = 0;
+        unsigned char nType = 0;
+        uint160 addrFrom(0), addrTo(0);
+        int64 nAmount = 0;
+        uint32_t nNonce = 0;
+        unsigned char solAddrTo[32] = {0};
+
+        if (!txdb.ReadAtomTx(txhash, nHeight, nTime, nType, addrFrom, addrTo, nAmount, nNonce, solAddrTo))
+            continue;
+
+        string strType;
+        if (nType == ATOM_TYPE_TRANSFER) strType = "transfer";
+        else if (nType == ATOM_TYPE_BRIDGE_TO_SOL) strType = "bridge_to_sol";
+        else if (nType == ATOM_TYPE_BRIDGE_TO_BITOK) strType = "bridge_to_bitok";
+        else if (nType == ATOM_TYPE_COINBASE) strType = "coinbase";
+        else strType = "unknown";
+
+        bool fFrom = (addrFrom == hash160);
+        bool fTo   = (addrTo   == hash160);
+
+        string strDir;
+        if (nType == ATOM_TYPE_BRIDGE_TO_SOL)
+            strDir = "bridge_to_sol";
+        else if (nType == ATOM_TYPE_BRIDGE_TO_BITOK)
+            strDir = "bridge_to_bitok";
+        else if (nType == ATOM_TYPE_COINBASE)
+            strDir = "coinbase";
+        else if (fFrom && fTo)
+            strDir = "self";
+        else
+            strDir = fTo ? "received" : "sent";
+
+        Object entry;
+        entry.push_back(Pair("txid",      txhash.ToString()));
+        entry.push_back(Pair("type",      strType));
+        entry.push_back(Pair("status",    string("mined")));
+        entry.push_back(Pair("direction", strDir));
+        entry.push_back(Pair("height",    nHeight));
+        entry.push_back(Pair("time",      (int64_t)nTime));
+        entry.push_back(Pair("from",      Hash160ToAddress(addrFrom)));
+        if (nType == ATOM_TYPE_BRIDGE_TO_SOL)
+        {
+            entry.push_back(Pair("solana_destination", SolAddrToBase58(solAddrTo)));
+        }
+        else
+        {
+            entry.push_back(Pair("to",    Hash160ToAddress(addrTo)));
+        }
+        entry.push_back(Pair("amount",    AtomToDouble(nAmount)));
+        entry.push_back(Pair("amount_raw",(int64_t)nAmount));
+        entry.push_back(Pair("nonce",     (int64_t)nNonce));
+        ret.push_back(entry);
+    }
+
+    txdb.Close();
+    return ret;
+}
+
+
+Value sendatom(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 2)
+        throw runtime_error(
+            "sendatom <toaddress> <amount>\n"
+            "Send <amount> ATOM to <toaddress>.\n"
+            "Funds are drawn from all wallet addresses as needed, largest balance first.\n"
+            "If a single address covers the amount, one transaction is broadcast.\n"
+            "Otherwise multiple transactions are broadcast automatically.\n"
+            "<amount> is in ATOM units (e.g. 1.5 = 1.5 ATOM).\n"
+            "Use createatomrawtx for web wallets or custom key management.");
+
+    string strTo   = params[0].get_str();
+    double dAmount = params[1].get_real();
+
+    if (dAmount <= 0.0)
+        throw runtime_error("Amount must be positive");
+    if (dAmount > (double)ATOM_MAX_SUPPLY / (double)ATOM_DECIMALS)
+        throw runtime_error("Amount exceeds ATOM max supply");
+
+    uint160 hash160To;
+    if (!AddressToHash160(strTo, hash160To))
+        throw runtime_error("Invalid to address");
+
+    int64 nAmount = roundint64(dAmount * (double)ATOM_DECIMALS);
+    if (nAmount <= 0)
+        throw runtime_error("Amount too small");
+
+    // Collect all wallet addresses with a spendable ATOM balance, sorted largest first.
+    struct AtomSource
+    {
+        uint160  h160;
+        string   strAddr;
+        int64    nSpendable;
+        uint32_t nConfirmedNonce;
+    };
+    std::vector<AtomSource> sources;
+    int64 nTotalSpendable = 0;
+
+    {
+        CTxDB txdb("r");
+        CRITICAL_BLOCK(cs_mapKeys)
+        {
+            for (map<vector<unsigned char>, CPrivKey>::iterator it = mapKeys.begin();
+                 it != mapKeys.end(); ++it)
+            {
+                const vector<unsigned char>& vchPubKey = it->first;
+                uint160 h160 = Hash160(vchPubKey);
+
+                int64    nConf  = 0;
+                uint32_t nNonce = 0;
+                txdb.ReadAtomBalance(h160, nConf, nNonce);
+
+                int64 nSpend = AtomGetEffectiveBalance(h160, nConf);
+                if (nSpend > 0)
+                {
+                    AtomSource s;
+                    s.h160             = h160;
+                    s.strAddr          = PubKeyToAddress(vchPubKey);
+                    s.nSpendable       = nSpend;
+                    s.nConfirmedNonce  = nNonce;
+                    sources.push_back(s);
+                    nTotalSpendable   += nSpend;
+                }
+            }
+        }
+        txdb.Close();
+    }
+
+    if (sources.empty())
+        throw runtime_error("No wallet addresses with ATOM balance found");
+
+    if (nTotalSpendable < nAmount)
+        throw runtime_error(strprintf("Insufficient ATOM balance in wallet: total spendable %" PRI64d
+                                      " need %" PRI64d, nTotalSpendable, nAmount));
+
+    // Sort sources: largest spendable balance first so we minimise the number of transactions.
+    std::sort(sources.begin(), sources.end(),
+              [](const AtomSource& a, const AtomSource& b){ return a.nSpendable > b.nSpendable; });
+
+    CScript scriptDest;
+    if (!scriptDest.SetBitcoinAddress(strTo))
+        throw runtime_error("Failed to build destination script for: " + strTo);
+
+    int64      nRemaining = nAmount;
+    Array      txids;
+    string     strFirstFrom;
+
+    for (size_t i = 0; i < sources.size() && nRemaining > 0; i++)
+    {
+        const AtomSource& src = sources[i];
+
+        int64 nSend = (src.nSpendable >= nRemaining) ? nRemaining : src.nSpendable;
+
+        // Determine next valid nonce for this source address.
+        uint32_t nNextNonce = src.nConfirmedNonce + 1;
+        CRITICAL_BLOCK(cs_mapAtomMempool)
+        {
+            std::map<uint160, uint32_t>::iterator it = mapAtomMempoolNonce.find(src.h160);
+            if (it != mapAtomMempoolNonce.end() && it->second >= nNextNonce)
+                nNextNonce = it->second + 1;
+        }
+
+        CAtomTransfer transfer;
+        transfer.nVersion = ATOM_VERSION;
+        transfer.nType    = ATOM_TYPE_TRANSFER;
+        transfer.addrFrom = src.h160;
+        transfer.addrTo   = hash160To;
+        transfer.nAmount  = nSend;
+        transfer.nNonce   = nNextNonce;
+
+        CScript scriptOpReturn = BuildAtomScript(transfer);
+
+        CWalletTx wtx;
+        CKey changeKey;
+        int64 nFeeRequired = 0;
+
+        if (!CreateStealthTransaction(scriptDest, scriptOpReturn, DUST_THRESHOLD, wtx, changeKey, nFeeRequired))
+        {
+            string strError;
+            if (DUST_THRESHOLD + nFeeRequired > GetBalance())
+                strError = strprintf("Insufficient Bitok balance to pay fee. Need %s",
+                                     FormatMoney(DUST_THRESHOLD + nFeeRequired).c_str());
+            else
+                strError = "Transaction creation failed";
+            throw runtime_error(strError);
+        }
+
+        if (!CommitTransaction(wtx, changeKey))
+            throw runtime_error("Transaction broadcast failed");
+
+        txids.push_back(wtx.GetHash().ToString());
+
+        if (strFirstFrom.empty())
+            strFirstFrom = src.strAddr;
+
+        nRemaining -= nSend;
+    }
+
+    if (txids.size() == 1)
+    {
+        Object result;
+        result.push_back(Pair("txid",       txids[0]));
+        result.push_back(Pair("from",       strFirstFrom));
+        result.push_back(Pair("to",         strTo));
+        result.push_back(Pair("amount",     dAmount));
+        result.push_back(Pair("amount_raw", (int64_t)nAmount));
+        result.push_back(Pair("status",     string("pending")));
+        return result;
+    }
+
+    Object result;
+    result.push_back(Pair("txids",      txids));
+    result.push_back(Pair("to",         strTo));
+    result.push_back(Pair("amount",     dAmount));
+    result.push_back(Pair("amount_raw", (int64_t)nAmount));
+    result.push_back(Pair("tx_count",   (int64_t)txids.size()));
+    result.push_back(Pair("status",     string("pending")));
+    return result;
+}
+
+
+Value listatomtransactions(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() > 1)
+        throw runtime_error(
+            "listatomtransactions [count=50]\n"
+            "Returns ATOM transactions involving any address in the local wallet, newest first.\n"
+            "Includes both mempool (status=pending) and mined (status=mined) transactions.\n"
+            "Does NOT require -indexer — works on any node with a wallet.");
+
+    int nCount = 50;
+    if (params.size() > 0)
+        nCount = params[0].get_int();
+    if (nCount <= 0)
+        throw runtime_error("count must be positive");
+
+    // Collect all wallet hash160s
+    std::set<uint160> setWallet;
+    CRITICAL_BLOCK(cs_mapKeys)
+    {
+        for (map<vector<unsigned char>, CPrivKey>::iterator it = mapKeys.begin();
+             it != mapKeys.end(); ++it)
+        {
+            setWallet.insert(Hash160(it->first));
+        }
+    }
+
+    if (setWallet.empty())
+        return Array();
+
+    Array ret;
+
+    // Mempool first: scan all pending ATOM transfers for any wallet address
+    std::set<uint256> setMempool;
+    CRITICAL_BLOCK(cs_mapAtomMempool)
+    {
+        for (std::map<uint256, CAtomTransfer>::iterator it = mapAtomMempoolTx.begin();
+             it != mapAtomMempoolTx.end(); ++it)
+        {
+            const CAtomTransfer& t = it->second;
+            bool fFromWallet = setWallet.count(t.addrFrom) > 0;
+            bool fToWallet   = setWallet.count(t.addrTo)   > 0;
+            if (!fFromWallet && !fToWallet)
+                continue;
+
+            setMempool.insert(it->first);
+
+            string strType;
+            if (t.nType == ATOM_TYPE_TRANSFER) strType = "transfer";
+            else if (t.nType == ATOM_TYPE_BRIDGE_TO_SOL) strType = "bridge_to_sol";
+            else if (t.nType == ATOM_TYPE_BRIDGE_TO_BITOK) strType = "bridge_to_bitok";
+            else if (t.nType == ATOM_TYPE_COINBASE) strType = "coinbase";
+            else strType = "unknown";
+
+            string strDir;
+            if (t.nType == ATOM_TYPE_BRIDGE_TO_SOL)
+                strDir = "bridge_to_sol";
+            else if (t.nType == ATOM_TYPE_BRIDGE_TO_BITOK)
+                strDir = "bridge_to_bitok";
+            else if (t.nType == ATOM_TYPE_COINBASE)
+                strDir = "coinbase";
+            else if (fToWallet && fFromWallet)
+                strDir = "self";
+            else
+                strDir = fToWallet ? "received" : "sent";
+
+            Object entry;
+            entry.push_back(Pair("txid",      it->first.ToString()));
+            entry.push_back(Pair("type",      strType));
+            entry.push_back(Pair("status",    string("pending")));
+            entry.push_back(Pair("direction", strDir));
+            entry.push_back(Pair("from",      Hash160ToAddress(t.addrFrom)));
+            if (t.nType == ATOM_TYPE_BRIDGE_TO_SOL)
+                entry.push_back(Pair("solana_destination", SolAddrToBase58(t.solAddrTo)));
+            else
+                entry.push_back(Pair("to",    Hash160ToAddress(t.addrTo)));
+            entry.push_back(Pair("amount",    AtomToDouble(t.nAmount)));
+            entry.push_back(Pair("amount_raw",(int64_t)t.nAmount));
+            entry.push_back(Pair("nonce",     (int64_t)t.nNonce));
+            ret.push_back(entry);
+        }
+    }
+
+    // Mined: scan wallet transactions for ATOM payloads
+    vector<pair<int64, uint256> > vSorted;
+    CRITICAL_BLOCK(cs_mapWallet)
+    {
+        for (map<uint256, CWalletTx>::iterator it = mapWallet.begin(); it != mapWallet.end(); ++it)
+        {
+            const CWalletTx& wtx = it->second;
+            if (wtx.GetDepthInMainChain() <= 0)
+                continue;
+            vSorted.push_back(make_pair(wtx.nTimeReceived, wtx.GetHash()));
+        }
+    }
+    sort(vSorted.rbegin(), vSorted.rend());
+
+    CTxDB txdb("r");
+    int nMined = 0;
+    for (vector<pair<int64, uint256> >::iterator it = vSorted.begin();
+         it != vSorted.end() && nMined < nCount; ++it)
+    {
+        const uint256& txhash = it->second;
+        if (setMempool.count(txhash))
+            continue;
+
+        int nHeight = 0;
+        unsigned int nTime = 0;
+        unsigned char nType = 0;
+        uint160 addrFrom(0), addrTo(0);
+        int64 nAmount = 0;
+        uint32_t nNonce = 0;
+        unsigned char solAddrTo[32] = {0};
+
+        if (!txdb.ReadAtomTx(txhash, nHeight, nTime, nType, addrFrom, addrTo, nAmount, nNonce, solAddrTo))
+            continue;
+
+        bool fFromWallet = setWallet.count(addrFrom) > 0;
+        bool fToWallet   = setWallet.count(addrTo)   > 0;
+        if (!fFromWallet && !fToWallet)
+            continue;
+
+        string strType;
+        if (nType == ATOM_TYPE_TRANSFER) strType = "transfer";
+        else if (nType == ATOM_TYPE_BRIDGE_TO_SOL) strType = "bridge_to_sol";
+        else if (nType == ATOM_TYPE_BRIDGE_TO_BITOK) strType = "bridge_to_bitok";
+        else if (nType == ATOM_TYPE_COINBASE) strType = "coinbase";
+        else strType = "unknown";
+
+        string strDir;
+        if (nType == ATOM_TYPE_BRIDGE_TO_SOL)
+            strDir = "bridge_to_sol";
+        else if (nType == ATOM_TYPE_BRIDGE_TO_BITOK)
+            strDir = "bridge_to_bitok";
+        else if (nType == ATOM_TYPE_COINBASE)
+            strDir = "coinbase";
+        else if (fToWallet && fFromWallet)
+            strDir = "self";
+        else
+            strDir = fToWallet ? "received" : "sent";
+
+        Object entry;
+        entry.push_back(Pair("txid",      txhash.ToString()));
+        entry.push_back(Pair("type",      strType));
+        entry.push_back(Pair("status",    string("mined")));
+        entry.push_back(Pair("direction", strDir));
+        entry.push_back(Pair("height",    nHeight));
+        entry.push_back(Pair("time",      (int64_t)nTime));
+        entry.push_back(Pair("from",      Hash160ToAddress(addrFrom)));
+        if (nType == ATOM_TYPE_BRIDGE_TO_SOL)
+        {
+            entry.push_back(Pair("solana_destination", SolAddrToBase58(solAddrTo)));
+        }
+        else
+        {
+            entry.push_back(Pair("to",    Hash160ToAddress(addrTo)));
+        }
+        entry.push_back(Pair("amount",    AtomToDouble(nAmount)));
+        entry.push_back(Pair("amount_raw",(int64_t)nAmount));
+        entry.push_back(Pair("nonce",     (int64_t)nNonce));
+        ret.push_back(entry);
+        nMined++;
+    }
+    txdb.Close();
+
+    return ret;
+}
+
+
+Value getnextatomnonce(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 1)
+        throw runtime_error(
+            "getnextatomnonce <address>\n"
+            "Returns the next valid ATOM nonce for <address>.\n"
+            "Accounts for both the confirmed nonce in the DB and any pending\n"
+            "transactions already in the mempool, so the returned nonce is\n"
+            "safe to use immediately in createatomrawtx or a manually built tx.");
+
+    string strAddress = params[0].get_str();
+    uint160 hash160;
+    if (!AddressToHash160(strAddress, hash160))
+        throw runtime_error("Invalid Bitok address");
+
+    CTxDB txdb("r");
+    int64 nConfirmedBalance = 0;
+    uint32_t nConfirmedNonce = 0;
+    txdb.ReadAtomBalance(hash160, nConfirmedBalance, nConfirmedNonce);
+    txdb.Close();
+
+    uint32_t nNextNonce = nConfirmedNonce + 1;
+    CRITICAL_BLOCK(cs_mapAtomMempool)
+    {
+        std::map<uint160, uint32_t>::iterator it = mapAtomMempoolNonce.find(hash160);
+        if (it != mapAtomMempoolNonce.end() && it->second >= nNextNonce)
+            nNextNonce = it->second + 1;
+    }
+
+    Object result;
+    result.push_back(Pair("address",         strAddress));
+    result.push_back(Pair("confirmed_nonce", (int64_t)nConfirmedNonce));
+    result.push_back(Pair("next_nonce",      (int64_t)nNextNonce));
+    return result;
+}
+
+
+Value createatomrawtx(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() < 4 || params.size() > 5)
+        throw runtime_error(
+            "createatomrawtx <fromaddress> <toaddress> <amount> <nonce> [{\"txid\":\"id\",\"vout\":n},...]\n"
+            "Build an unsigned raw transaction carrying an ATOM transfer in its OP_RETURN output.\n"
+            "<fromaddress>  sender's Bitok address (HASH160 is embedded in the ATOM payload)\n"
+            "<toaddress>    recipient's Bitok address\n"
+            "<amount>       ATOM amount in ATOM units (e.g. 1.5 = 1.5 ATOM)\n"
+            "<nonce>        per-sender monotonic counter; use getnextatomnonce to get the correct value\n"
+            "[inputs]       optional array of UTXOs to fund the Bitok tx outputs;\n"
+            "               if omitted the tx has no inputs (useful when the caller selects\n"
+            "               coins and appends inputs externally before signing)\n"
+            "Returns hex-encoded unsigned raw transaction.\n"
+            "Sign with signrawtransaction, then broadcast with sendrawtransaction.\n"
+            "The tx must include at least one output paying DUST_THRESHOLD (0.01 BITOK) to\n"
+            "<toaddress> and enough coin inputs to cover that dust plus the network fee.");
+
+    string strFrom   = params[0].get_str();
+    string strTo     = params[1].get_str();
+    double dAmount   = params[2].get_real();
+    int64  nNonce    = params[3].get_int64();
+
+    if (dAmount <= 0.0)
+        throw runtime_error("Amount must be positive");
+    if (dAmount > (double)ATOM_MAX_SUPPLY / (double)ATOM_DECIMALS)
+        throw runtime_error("Amount exceeds ATOM max supply");
+    if (nNonce <= 0 || nNonce > 0xffffffff)
+        throw runtime_error("nonce must be a positive integer (use getnextatomnonce)");
+
+    uint160 hash160From, hash160To;
+    if (!AddressToHash160(strFrom, hash160From))
+        throw runtime_error("Invalid from address");
+    if (!AddressToHash160(strTo, hash160To))
+        throw runtime_error("Invalid to address");
+
+    int64 nAmount = roundint64(dAmount * (double)ATOM_DECIMALS);
+    if (nAmount <= 0)
+        throw runtime_error("Amount too small");
+
+    CAtomTransfer transfer;
+    transfer.nVersion = ATOM_VERSION;
+    transfer.nType    = ATOM_TYPE_TRANSFER;
+    transfer.addrFrom = hash160From;
+    transfer.addrTo   = hash160To;
+    transfer.nAmount  = nAmount;
+    transfer.nNonce   = (uint32_t)nNonce;
+
+    CScript scriptOpReturn = BuildAtomScript(transfer);
+
+    CScript scriptDest;
+    if (!scriptDest.SetBitcoinAddress(strTo))
+        throw runtime_error("Failed to build destination script for: " + strTo);
+
+    CTransaction rawTx;
+
+    if (params.size() > 4)
+    {
+        const Array& inputs = params[4].get_array();
+        foreach(const Value& input, inputs)
+        {
+            const Object& o = input.get_obj();
+            Value txidVal = find_value(o, "txid");
+            Value voutVal = find_value(o, "vout");
+            if (txidVal.type() != str_type || voutVal.type() != int_type)
+                throw runtime_error("Invalid input: each input must have txid (string) and vout (integer)");
+            uint256 txid;
+            txid.SetHex(txidVal.get_str());
+            int nOutput = voutVal.get_int();
+            if (nOutput < 0)
+                throw runtime_error("Invalid parameter, vout must be non-negative");
+            rawTx.vin.push_back(CTxIn(COutPoint(txid, nOutput)));
+        }
+    }
+
+    rawTx.vout.push_back(CTxOut(DUST_THRESHOLD, scriptDest));
+    rawTx.vout.push_back(CTxOut(0, scriptOpReturn));
+
+    CDataStream ss(SER_NETWORK);
+    ss << rawTx;
+
+    Object result;
+    result.push_back(Pair("hex",        HexStr(ss.begin(), ss.end(), false)));
+    result.push_back(Pair("from",       strFrom));
+    result.push_back(Pair("to",         strTo));
+    result.push_back(Pair("amount",     dAmount));
+    result.push_back(Pair("amount_raw", (int64_t)nAmount));
+    result.push_back(Pair("nonce",      (int64_t)nNonce));
+    result.push_back(Pair("dust_out",   (int64_t)DUST_THRESHOLD));
+    result.push_back(Pair("note",       string("Add coin inputs (listunspent), sign with signrawtransaction, broadcast with sendrawtransaction")));
+    return result;
+}
+
+
+static string SolAddrToBase58(const unsigned char* p)
+{
+    return EncodeBase58(p, p + 32);
+}
+
+static bool ParseSolAddr(const string& str, unsigned char* out32)
+{
+    vector<unsigned char> vch;
+    if (!DecodeBase58(str.c_str(), vch))
+        return false;
+    if (vch.size() != 32)
+        return false;
+    memcpy(out32, &vch[0], 32);
+    return true;
+}
+
+
+Value bridgeatomtosol(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 2)
+        throw runtime_error(
+            "bridgeatomtosol <solana_address> <amount>\n"
+            "Bridge <amount> ATOM to a Solana address.\n"
+            "Burns ATOM on the Bitok side; the bridge mints the equivalent on Solana.\n"
+            "<solana_address>  Solana address in Base58 format (e.g. 6e5ZCp6V5ogM7o8bkJhcjzJSqJqbKMs4jAtSqDujDaxr).\n"
+            "<amount>          ATOM amount in ATOM units (e.g. 1.5 = 1.5 ATOM).\n"
+            "Funds are drawn from the wallet address with the largest spendable ATOM balance.");
+
+    string strSolInput = params[0].get_str();
+    double dAmount     = params[1].get_real();
+
+    unsigned char solAddr[32];
+    if (!ParseSolAddr(strSolInput, solAddr))
+        throw runtime_error("Invalid Solana address: expected Base58 format (e.g. 6e5ZCp6V5ogM7o8bkJhcjzJSqJqbKMs4jAtSqDujDaxr)");
+
+    bool fAllZero = true;
+    for (int i = 0; i < 32; i++)
+        if (solAddr[i] != 0) { fAllZero = false; break; }
+    if (fAllZero)
+        throw runtime_error("Solana address must not be all zeros");
+
+    if (dAmount <= 0.0)
+        throw runtime_error("Amount must be positive");
+    if (dAmount > (double)ATOM_MAX_SUPPLY / (double)ATOM_DECIMALS)
+        throw runtime_error("Amount exceeds ATOM max supply");
+
+    int64 nAmount = roundint64(dAmount * (double)ATOM_DECIMALS);
+    if (nAmount <= 0)
+        throw runtime_error("Amount too small");
+
+    // Find the wallet address with the largest spendable ATOM balance.
+    uint160  h160Best;
+    string   strAddrBest;
+    int64    nSpendableBest   = 0;
+    uint32_t nConfirmedNonce  = 0;
+
+    {
+        CTxDB txdb("r");
+        CRITICAL_BLOCK(cs_mapKeys)
+        {
+            for (map<vector<unsigned char>, CPrivKey>::iterator it = mapKeys.begin();
+                 it != mapKeys.end(); ++it)
+            {
+                const vector<unsigned char>& vchPubKey = it->first;
+                uint160 h160 = Hash160(vchPubKey);
+
+                int64    nConf  = 0;
+                uint32_t nNonce = 0;
+                txdb.ReadAtomBalance(h160, nConf, nNonce);
+
+                int64 nSpend = AtomGetEffectiveBalance(h160, nConf);
+                if (nSpend > nSpendableBest)
+                {
+                    nSpendableBest  = nSpend;
+                    h160Best        = h160;
+                    strAddrBest     = PubKeyToAddress(vchPubKey);
+                    nConfirmedNonce = nNonce;
+                }
+            }
+        }
+        txdb.Close();
+    }
+
+    if (nSpendableBest <= 0)
+        throw runtime_error("No wallet addresses with ATOM balance found");
+    if (nSpendableBest < nAmount)
+        throw runtime_error(strprintf("Insufficient ATOM balance: spendable %" PRI64d
+                                      " need %" PRI64d, nSpendableBest, nAmount));
+
+    uint32_t nNextNonce = nConfirmedNonce + 1;
+    CRITICAL_BLOCK(cs_mapAtomMempool)
+    {
+        std::map<uint160, uint32_t>::iterator it = mapAtomMempoolNonce.find(h160Best);
+        if (it != mapAtomMempoolNonce.end() && it->second >= nNextNonce)
+            nNextNonce = it->second + 1;
+    }
+
+    CAtomTransfer transfer;
+    transfer.nVersion = ATOM_VERSION;
+    transfer.nType    = ATOM_TYPE_BRIDGE_TO_SOL;
+    transfer.addrFrom = h160Best;
+    transfer.addrTo   = uint160(0);
+    memcpy(transfer.solAddrTo, solAddr, 32);
+    transfer.nAmount  = nAmount;
+    transfer.nNonce   = nNextNonce;
+
+    CScript scriptOpReturn = BuildAtomScript(transfer);
+
+    // Dust output returns to sender (bridge burns ATOM; no Bitok recipient).
+    CScript scriptSender;
+    if (!scriptSender.SetBitcoinAddress(strAddrBest))
+        throw runtime_error("Failed to build sender script for: " + strAddrBest);
+
+    CWalletTx wtx;
+    CKey changeKey;
+    int64 nFeeRequired = 0;
+
+    if (!CreateStealthTransaction(scriptSender, scriptOpReturn, DUST_THRESHOLD, wtx, changeKey, nFeeRequired))
+    {
+        string strError;
+        if (DUST_THRESHOLD + nFeeRequired > GetBalance())
+            strError = strprintf("Insufficient Bitok balance to pay fee. Need %s",
+                                 FormatMoney(DUST_THRESHOLD + nFeeRequired).c_str());
+        else
+            strError = "Transaction creation failed";
+        throw runtime_error(strError);
+    }
+
+    if (!CommitTransaction(wtx, changeKey))
+        throw runtime_error("Transaction broadcast failed");
+
+    Object result;
+    result.push_back(Pair("txid",              wtx.GetHash().ToString()));
+    result.push_back(Pair("from",              strAddrBest));
+    result.push_back(Pair("solana_destination",SolAddrToBase58(solAddr)));
+    result.push_back(Pair("amount",            dAmount));
+    result.push_back(Pair("amount_raw",        (int64_t)nAmount));
+    result.push_back(Pair("status",            string("pending")));
+    return result;
+}
+
+
+Value getatominfo(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 0)
+        throw runtime_error(
+            "getatominfo\n"
+            "Returns ATOM layer parameters and statistics.");
+
+    Object result;
+    result.push_back(Pair("name",          string("ATOM")));
+    result.push_back(Pair("version",       (int)ATOM_VERSION));
+    result.push_back(Pair("decimals",      ATOM_DECIMALS_INT));
+    result.push_back(Pair("decimals_unit", (int64_t)ATOM_DECIMALS));
+    result.push_back(Pair("max_supply",    AtomToDouble(ATOM_MAX_SUPPLY)));
+    result.push_back(Pair("max_supply_raw",(int64_t)ATOM_MAX_SUPPLY));
+    result.push_back(Pair("payload_size",       ATOM_PAYLOAD_SIZE));
+    result.push_back(Pair("activation_height", ATOM_ACTIVATION_HEIGHT));
+    result.push_back(Pair("max_nonce_gap",     (int)ATOM_MAX_NONCE_GAP));
+    result.push_back(Pair("finality",          string("confirmed")));
+    result.push_back(Pair("pending_txs",       (int64_t)mapAtomMempoolTx.size()));
+    return result;
+}
+
+
+Value gettotalatomsupply(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 0)
+        throw runtime_error(
+            "gettotalatomsupply\n"
+            "Returns the total circulating ATOM supply — sum of all confirmed ATOM balances on-chain.");
+
+    CTxDB txdb("r");
+    int64 nTotal = 0;
+    if (!txdb.SumAllAtomBalances(nTotal))
+        throw runtime_error("Failed to read ATOM balances from database");
+    txdb.Close();
+
+    Object result;
+    result.push_back(Pair("total_supply",     AtomToDouble(nTotal)));
+    result.push_back(Pair("total_supply_raw", (int64_t)nTotal));
+    result.push_back(Pair("max_supply",       AtomToDouble(ATOM_MAX_SUPPLY)));
+    result.push_back(Pair("max_supply_raw",   (int64_t)ATOM_MAX_SUPPLY));
+    result.push_back(Pair("decimals",         ATOM_DECIMALS_INT));
+    return result;
+}
+
+
 //
 // Call Table
 //
@@ -4263,6 +5255,18 @@ pair<string, rpcfn_type> pCallTable[] =
     make_pair("getnewstealthaddress",  &getnewstealthaddress),
     make_pair("liststealthaddresses",  &liststealthaddresses),
     make_pair("decodestealthaddress",  &decodestealthaddress),
+
+    make_pair("getatominfo",             &getatominfo),
+    make_pair("gettotalatomsupply",      &gettotalatomsupply),
+    make_pair("getatombalance",          &getatombalance),
+    make_pair("getaddressatombalance",   &getaddressatombalance),
+    make_pair("getnextatomnonce",        &getnextatomnonce),
+    make_pair("getatomtx",               &getatomtx),
+    make_pair("getatomhistory",          &getatomhistory),
+    make_pair("listatomtransactions",    &listatomtransactions),
+    make_pair("createatomrawtx",         &createatomrawtx),
+    make_pair("sendatom",                &sendatom),
+    make_pair("bridgeatomtosol",         &bridgeatomtosol),
 };
 map<string, rpcfn_type> mapCallTable(pCallTable, pCallTable + sizeof(pCallTable)/sizeof(pCallTable[0]));
 

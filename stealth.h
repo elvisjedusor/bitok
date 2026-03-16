@@ -1,4 +1,4 @@
-// Copyright (c) 2024 Bitok Developers
+// Copyright (c) 2026 Bitok Developers
 // Stealth address support - implementing Satoshi's "key blinding" concept
 // from the BitcoinTalk "Not a suggestion" thread (August 2010)
 //
