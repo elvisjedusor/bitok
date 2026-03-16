@@ -5182,6 +5182,552 @@ Value gettotalatomsupply(const Array& params, bool fHelp)
 }
 
 
+// ---------------------------------------------------------------------------
+// DEX RPC commands
+// ---------------------------------------------------------------------------
+
+Value dexsell(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 2)
+        throw runtime_error(
+            "dexsell <atom_amount> <price>\n"
+            "Sell ATOM on the DEX. Your ATOM is locked on-chain until taken or cancelled.\n"
+            "  <atom_amount> ATOM quantity to sell (e.g. 100.5).\n"
+            "  <price>       Ask price in BITOK per 1 ATOM (e.g. 0.05).");
+
+    double dAtomAmount = params[0].get_real();
+    if (dAtomAmount <= 0.0)
+        throw runtime_error("atom_amount must be positive");
+    int64 nAtomAmount = roundint64(dAtomAmount * (double)ATOM_DECIMALS);
+    if (nAtomAmount <= 0)
+        throw runtime_error("atom_amount too small");
+
+    double dPrice = params[1].get_real();
+    if (dPrice <= 0.0)
+        throw runtime_error("price must be positive");
+    int64 nPrice = roundint64(dPrice * (double)COIN);
+    if (nPrice <= 0)
+        throw runtime_error("price too small");
+
+    uint160 h160Best;
+    string strAddrBest;
+    int64 nSpendableBest = 0;
+    uint32_t nConfirmedNonce = 0;
+
+    {
+        CTxDB txdb("r");
+        CRITICAL_BLOCK(cs_mapKeys)
+        {
+            for (map<vector<unsigned char>, CPrivKey>::iterator it = mapKeys.begin();
+                 it != mapKeys.end(); ++it)
+            {
+                const vector<unsigned char>& vchPubKey = it->first;
+                uint160 h160 = Hash160(vchPubKey);
+                int64 nConf = 0;
+                uint32_t nNon = 0;
+                txdb.ReadAtomBalance(h160, nConf, nNon);
+                int64 nSpend = AtomGetEffectiveBalance(h160, nConf);
+                if (nSpend > nSpendableBest)
+                {
+                    h160Best = h160;
+                    strAddrBest = PubKeyToAddress(vchPubKey);
+                    nSpendableBest = nSpend;
+                    nConfirmedNonce = nNon;
+                }
+            }
+        }
+        txdb.Close();
+    }
+
+    if (h160Best == 0)
+        throw runtime_error("No wallet addresses found");
+
+    if (nSpendableBest < nAtomAmount)
+        throw runtime_error(strprintf("Insufficient ATOM balance: spendable %s need %s",
+                                      FormatMoney(nSpendableBest).c_str(),
+                                      FormatMoney(nAtomAmount).c_str()));
+
+    int64 nTotalBitok = DexComputeBitokPayment(nAtomAmount, nPrice);
+    if (nTotalBitok <= 0)
+        throw runtime_error("Order too small: total BITOK payment rounds to zero");
+
+    uint32_t nNextNonce = nConfirmedNonce + 1;
+    CRITICAL_BLOCK(cs_mapAtomMempool)
+    {
+        std::map<uint160, uint32_t>::iterator it = mapAtomMempoolNonce.find(h160Best);
+        if (it != mapAtomMempoolNonce.end() && it->second >= nNextNonce)
+            nNextNonce = it->second + 1;
+    }
+
+    CAtomDexOffer offer;
+    offer.nVersion    = ATOM_VERSION;
+    offer.nType       = ATOM_TYPE_DEX_OFFER;
+    offer.addrFrom    = h160Best;
+    offer.nSide       = ATOM_DEX_SIDE_SELL_ATOM;
+    offer.nAtomAmount = nAtomAmount;
+    offer.nPrice      = nPrice;
+    offer.nNonce      = nNextNonce;
+
+    CScript scriptOpReturn = BuildDexOfferScript(offer);
+
+    CScript scriptDest;
+    if (!scriptDest.SetBitcoinAddress(strAddrBest))
+        throw runtime_error("Failed to build destination script");
+
+    CWalletTx wtx;
+    CKey changeKey;
+    int64 nFeeRequired = 0;
+
+    if (!CreateStealthTransaction(scriptDest, scriptOpReturn, DUST_THRESHOLD, wtx, changeKey, nFeeRequired))
+    {
+        if (DUST_THRESHOLD + nFeeRequired > GetBalance())
+            throw runtime_error(strprintf("Insufficient Bitok balance to pay fee. Need %s",
+                                         FormatMoney(DUST_THRESHOLD + nFeeRequired).c_str()));
+        throw runtime_error("Transaction creation failed");
+    }
+
+    if (!CommitTransaction(wtx, changeKey))
+        throw runtime_error("Transaction broadcast failed");
+
+    Object result;
+    result.push_back(Pair("txid",        wtx.GetHash().ToString()));
+    result.push_back(Pair("from",        strAddrBest));
+    result.push_back(Pair("atom_amount", dAtomAmount));
+    result.push_back(Pair("price",       dPrice));
+    result.push_back(Pair("total_bitok", (double)nTotalBitok / (double)COIN));
+    result.push_back(Pair("nonce",       (int64_t)nNextNonce));
+    result.push_back(Pair("status",      string("pending")));
+    return result;
+}
+
+
+Value dexcancel(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 1)
+        throw runtime_error(
+            "dexcancel <offer_txid>\n"
+            "Cancel an open sell order. You must be the maker.\n"
+            "Your locked ATOM will be returned to your balance.");
+
+    string strOfferTxid = params[0].get_str();
+    uint256 hashOffer;
+    hashOffer.SetHex(strOfferTxid);
+    if (hashOffer == 0)
+        throw runtime_error("Invalid offer txid");
+
+    CDexOrderEntry order;
+    CRITICAL_BLOCK(cs_mapDexOrders)
+    {
+        std::map<uint256, CDexOrderEntry>::iterator it = mapDexOrders.find(hashOffer);
+        if (it == mapDexOrders.end())
+            throw runtime_error("Offer not found in active order book: " + strOfferTxid);
+        order = it->second;
+    }
+
+    bool fOwner = false;
+    string strAddr;
+    CRITICAL_BLOCK(cs_mapKeys)
+    {
+        for (map<vector<unsigned char>, CPrivKey>::iterator it = mapKeys.begin();
+             it != mapKeys.end(); ++it)
+        {
+            if (Hash160(it->first) == order.addrMaker)
+            {
+                fOwner = true;
+                strAddr = PubKeyToAddress(it->first);
+                break;
+            }
+        }
+    }
+
+    if (!fOwner)
+        throw runtime_error("You are not the maker of this order");
+
+    CAtomDexCancel cancel;
+    cancel.nVersion  = ATOM_VERSION;
+    cancel.nType     = ATOM_TYPE_DEX_CANCEL;
+    cancel.addrFrom  = order.addrMaker;
+    cancel.hashOffer = hashOffer;
+
+    CScript scriptOpReturn = BuildDexCancelScript(cancel);
+
+    CScript scriptDest;
+    if (!scriptDest.SetBitcoinAddress(strAddr))
+        throw runtime_error("Failed to build destination script");
+
+    CWalletTx wtx;
+    CKey changeKey;
+    int64 nFeeRequired = 0;
+
+    if (!CreateStealthTransaction(scriptDest, scriptOpReturn, DUST_THRESHOLD, wtx, changeKey, nFeeRequired))
+    {
+        if (DUST_THRESHOLD + nFeeRequired > GetBalance())
+            throw runtime_error(strprintf("Insufficient Bitok balance to pay fee. Need %s",
+                                         FormatMoney(DUST_THRESHOLD + nFeeRequired).c_str()));
+        throw runtime_error("Transaction creation failed");
+    }
+
+    if (!CommitTransaction(wtx, changeKey))
+        throw runtime_error("Transaction broadcast failed");
+
+    Object result;
+    result.push_back(Pair("txid",       wtx.GetHash().ToString()));
+    result.push_back(Pair("cancelled",  strOfferTxid));
+    result.push_back(Pair("status",     string("pending")));
+    return result;
+}
+
+
+Value dexbuy(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() < 1 || params.size() > 2)
+        throw runtime_error(
+            "dexbuy <atom_amount> [max_price]\n"
+            "Buy ATOM from the cheapest sell order on the DEX.\n"
+            "You pay BITOK, you receive ATOM. Settlement is atomic.\n"
+            "  <atom_amount>  Min ATOM to buy (e.g. 100.5). Fills smallest order >= this amount.\n"
+            "                 Use 0 to fill the cheapest order entirely.\n"
+            "  [max_price]    Max price in BITOK per ATOM. Omit to take cheapest.");
+
+    double dAtomWant = params[0].get_real();
+    if (dAtomWant < 0.0)
+        throw runtime_error("atom_amount must not be negative");
+    int64 nAtomWant = roundint64(dAtomWant * (double)ATOM_DECIMALS);
+
+    int64 nMaxPrice = 0;
+    if (params.size() > 1)
+    {
+        double dMax = params[1].get_real();
+        if (dMax <= 0.0)
+            throw runtime_error("max_price must be positive");
+        nMaxPrice = roundint64(dMax * (double)COIN);
+    }
+
+    uint256 hashBestOffer;
+    CDexOrderEntry bestOrder;
+    bool fFoundOrder = false;
+
+    CRITICAL_BLOCK(cs_mapDexOrders)
+    {
+        for (std::map<uint256, CDexOrderEntry>::iterator it = mapDexOrders.begin();
+             it != mapDexOrders.end(); ++it)
+        {
+            const CDexOrderEntry& o = it->second;
+            if (o.nSide != ATOM_DEX_SIDE_SELL_ATOM)
+                continue;
+            if (nMaxPrice > 0 && o.nPrice > nMaxPrice)
+                continue;
+            if (nAtomWant > 0 && o.nAtomAmount < nAtomWant)
+                continue;
+            if (setDexMempoolTakes.count(it->first))
+                continue;
+            if (setDexMempoolCancels.count(it->first))
+                continue;
+            if (!fFoundOrder || o.nPrice < bestOrder.nPrice ||
+                (o.nPrice == bestOrder.nPrice && nAtomWant > 0 && o.nAtomAmount < bestOrder.nAtomAmount))
+            {
+                hashBestOffer = it->first;
+                bestOrder = o;
+                fFoundOrder = true;
+            }
+        }
+    }
+
+    if (!fFoundOrder)
+    {
+        if (nMaxPrice > 0)
+            throw runtime_error(strprintf("No sell orders at or below %s BITOK/ATOM",
+                                         FormatMoney(nMaxPrice).c_str()));
+        if (nAtomWant > 0)
+            throw runtime_error("No matching sell order found");
+        throw runtime_error("No sell orders available on the DEX");
+    }
+
+    uint160 h160Taker;
+    string strTakerAddr;
+    CRITICAL_BLOCK(cs_mapKeys)
+    {
+        for (map<vector<unsigned char>, CPrivKey>::iterator it = mapKeys.begin();
+             it != mapKeys.end(); ++it)
+        {
+            uint160 h = Hash160(it->first);
+            if (h != bestOrder.addrMaker)
+            {
+                h160Taker = h;
+                strTakerAddr = PubKeyToAddress(it->first);
+                break;
+            }
+        }
+    }
+
+    if (h160Taker == 0)
+        throw runtime_error("No suitable wallet address found");
+
+    int64 nBitokPayment = DexComputeBitokPayment(bestOrder.nAtomAmount, bestOrder.nPrice);
+    if (nBitokPayment + DUST_THRESHOLD > GetBalance())
+        throw runtime_error(strprintf("Insufficient BITOK. Need %s + fee",
+                                     FormatMoney(nBitokPayment).c_str()));
+
+    CAtomDexTake take;
+    take.nVersion  = ATOM_VERSION;
+    take.nType     = ATOM_TYPE_DEX_TAKE;
+    take.addrFrom  = h160Taker;
+    take.hashOffer = hashBestOffer;
+
+    CScript scriptOpReturn = BuildDexTakeScript(take);
+
+    CScript scriptDest;
+    string strMakerAddr = Hash160ToAddress(bestOrder.addrMaker);
+    if (!scriptDest.SetBitcoinAddress(strMakerAddr))
+        throw runtime_error("Failed to build maker destination script");
+
+    CWalletTx wtx;
+    CKey changeKey;
+    int64 nFeeRequired = 0;
+
+    if (!CreateStealthTransaction(scriptDest, scriptOpReturn, nBitokPayment, wtx, changeKey, nFeeRequired))
+    {
+        if (nBitokPayment + nFeeRequired > GetBalance())
+            throw runtime_error(strprintf("Insufficient BITOK. Need %s",
+                                         FormatMoney(nBitokPayment + nFeeRequired).c_str()));
+        throw runtime_error("Transaction creation failed");
+    }
+
+    if (!CommitTransaction(wtx, changeKey))
+        throw runtime_error("Transaction broadcast failed");
+
+    Object result;
+    result.push_back(Pair("txid",          wtx.GetHash().ToString()));
+    result.push_back(Pair("offer_taken",   hashBestOffer.ToString()));
+    result.push_back(Pair("taker",         strTakerAddr));
+    result.push_back(Pair("atom_received", AtomToDouble(bestOrder.nAtomAmount)));
+    result.push_back(Pair("bitok_paid",    (double)nBitokPayment / (double)COIN));
+    result.push_back(Pair("price",         (double)bestOrder.nPrice / (double)COIN));
+    result.push_back(Pair("status",        string("pending")));
+    return result;
+}
+
+Value dextake(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 1)
+        throw runtime_error(
+            "dextake <offer_txid>\n"
+            "Take (fill) a specific sell order by txid.\n"
+            "You pay BITOK to the seller, receive their ATOM. Atomic settlement.");
+
+    string strOfferTxid = params[0].get_str();
+    uint256 hashOffer;
+    hashOffer.SetHex(strOfferTxid);
+    if (hashOffer == 0)
+        throw runtime_error("Invalid offer txid");
+
+    CDexOrderEntry order;
+    CRITICAL_BLOCK(cs_mapDexOrders)
+    {
+        std::map<uint256, CDexOrderEntry>::iterator it = mapDexOrders.find(hashOffer);
+        if (it == mapDexOrders.end())
+            throw runtime_error("Order not found: " + strOfferTxid);
+        order = it->second;
+    }
+
+    uint160 h160Taker;
+    string strTakerAddr;
+    CRITICAL_BLOCK(cs_mapKeys)
+    {
+        for (map<vector<unsigned char>, CPrivKey>::iterator it = mapKeys.begin();
+             it != mapKeys.end(); ++it)
+        {
+            uint160 h = Hash160(it->first);
+            if (h != order.addrMaker)
+            {
+                h160Taker = h;
+                strTakerAddr = PubKeyToAddress(it->first);
+                break;
+            }
+        }
+    }
+
+    if (h160Taker == 0)
+        throw runtime_error("No suitable wallet address found");
+
+    int64 nBitokPayment = DexComputeBitokPayment(order.nAtomAmount, order.nPrice);
+    if (nBitokPayment + DUST_THRESHOLD > GetBalance())
+        throw runtime_error(strprintf("Insufficient BITOK. Need %s + fee",
+                                     FormatMoney(nBitokPayment).c_str()));
+
+    CAtomDexTake take;
+    take.nVersion  = ATOM_VERSION;
+    take.nType     = ATOM_TYPE_DEX_TAKE;
+    take.addrFrom  = h160Taker;
+    take.hashOffer = hashOffer;
+
+    CScript scriptOpReturn = BuildDexTakeScript(take);
+
+    CScript scriptDest;
+    string strMakerAddr = Hash160ToAddress(order.addrMaker);
+    if (!scriptDest.SetBitcoinAddress(strMakerAddr))
+        throw runtime_error("Failed to build maker destination script");
+
+    CWalletTx wtx;
+    CKey changeKey;
+    int64 nFeeRequired = 0;
+
+    if (!CreateStealthTransaction(scriptDest, scriptOpReturn, nBitokPayment, wtx, changeKey, nFeeRequired))
+    {
+        if (nBitokPayment + nFeeRequired > GetBalance())
+            throw runtime_error(strprintf("Insufficient BITOK. Need %s",
+                                         FormatMoney(nBitokPayment + nFeeRequired).c_str()));
+        throw runtime_error("Transaction creation failed");
+    }
+
+    if (!CommitTransaction(wtx, changeKey))
+        throw runtime_error("Transaction broadcast failed");
+
+    Object result;
+    result.push_back(Pair("txid",          wtx.GetHash().ToString()));
+    result.push_back(Pair("offer_taken",   strOfferTxid));
+    result.push_back(Pair("taker",         strTakerAddr));
+    result.push_back(Pair("atom_received", AtomToDouble(order.nAtomAmount)));
+    result.push_back(Pair("bitok_paid",    (double)nBitokPayment / (double)COIN));
+    result.push_back(Pair("price",         (double)order.nPrice / (double)COIN));
+    result.push_back(Pair("status",        string("pending")));
+    return result;
+}
+
+
+Value dexorderbook(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() > 0)
+        throw runtime_error(
+            "dexorderbook\n"
+            "Returns all open sell orders, sorted by price ascending (cheapest first).");
+
+    std::vector<std::pair<int64, Object> > vOrders;
+
+    CRITICAL_BLOCK(cs_mapDexOrders)
+    {
+        for (std::map<uint256, CDexOrderEntry>::iterator it = mapDexOrders.begin();
+             it != mapDexOrders.end(); ++it)
+        {
+            const CDexOrderEntry& o = it->second;
+
+            Object entry;
+            entry.push_back(Pair("txid",        it->first.ToString()));
+            entry.push_back(Pair("seller",      Hash160ToAddress(o.addrMaker)));
+            entry.push_back(Pair("atom_amount", AtomToDouble(o.nAtomAmount)));
+            entry.push_back(Pair("price",       (double)o.nPrice / (double)COIN));
+            entry.push_back(Pair("total_bitok", (double)DexComputeBitokPayment(o.nAtomAmount, o.nPrice) / (double)COIN));
+            entry.push_back(Pair("height",      o.nHeight));
+
+            vOrders.push_back(std::make_pair(o.nPrice, entry));
+        }
+    }
+
+    std::sort(vOrders.begin(), vOrders.end(),
+              [](const std::pair<int64, Object>& a, const std::pair<int64, Object>& b){ return a.first < b.first; });
+
+    Array orders;
+    for (size_t i = 0; i < vOrders.size(); i++)
+        orders.push_back(vOrders[i].second);
+
+    Object result;
+    result.push_back(Pair("orders",      orders));
+    result.push_back(Pair("total_count", (int64_t)vOrders.size()));
+    return result;
+}
+
+
+Value dexmyorders(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 0)
+        throw runtime_error(
+            "dexmyorders\n"
+            "Returns your open sell orders on the DEX.");
+
+    std::set<uint160> setWallet;
+    CRITICAL_BLOCK(cs_mapKeys)
+    {
+        for (map<vector<unsigned char>, CPrivKey>::iterator it = mapKeys.begin();
+             it != mapKeys.end(); ++it)
+            setWallet.insert(Hash160(it->first));
+    }
+
+    Array ret;
+    CRITICAL_BLOCK(cs_mapDexOrders)
+    {
+        for (std::map<uint256, CDexOrderEntry>::iterator it = mapDexOrders.begin();
+             it != mapDexOrders.end(); ++it)
+        {
+            const CDexOrderEntry& o = it->second;
+            if (setWallet.count(o.addrMaker))
+            {
+                Object entry;
+                entry.push_back(Pair("txid",        it->first.ToString()));
+                entry.push_back(Pair("address",     Hash160ToAddress(o.addrMaker)));
+                entry.push_back(Pair("atom_amount", AtomToDouble(o.nAtomAmount)));
+                entry.push_back(Pair("price",       (double)o.nPrice / (double)COIN));
+                entry.push_back(Pair("total_bitok", (double)DexComputeBitokPayment(o.nAtomAmount, o.nPrice) / (double)COIN));
+                entry.push_back(Pair("height",      o.nHeight));
+                ret.push_back(entry);
+            }
+        }
+    }
+
+    return ret;
+}
+
+
+Value dexinfo(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 0)
+        throw runtime_error(
+            "dexinfo\n"
+            "Returns DEX statistics and parameters.");
+
+    int64 nOrderCount = 0;
+    int64 nTotalAtom = 0;
+    int64 nTotalBitok = 0;
+    int64 nBestAsk = 0;
+
+    CRITICAL_BLOCK(cs_mapDexOrders)
+    {
+        for (std::map<uint256, CDexOrderEntry>::iterator it = mapDexOrders.begin();
+             it != mapDexOrders.end(); ++it)
+        {
+            const CDexOrderEntry& o = it->second;
+            nOrderCount++;
+            nTotalAtom += o.nAtomAmount;
+            nTotalBitok += DexComputeBitokPayment(o.nAtomAmount, o.nPrice);
+            if (nBestAsk == 0 || o.nPrice < nBestAsk)
+                nBestAsk = o.nPrice;
+        }
+    }
+
+    Object result;
+    result.push_back(Pair("activation_height", ATOM_DEX_ACTIVATION_HEIGHT));
+    result.push_back(Pair("open_orders",       (int64_t)nOrderCount));
+    result.push_back(Pair("total_atom",        AtomToDouble(nTotalAtom)));
+    result.push_back(Pair("total_bitok_value", (double)nTotalBitok / (double)COIN));
+    if (nBestAsk > 0)
+        result.push_back(Pair("cheapest_ask",  (double)nBestAsk / (double)COIN));
+    else
+        result.push_back(Pair("cheapest_ask",  Value::null));
+    {
+        int64_t nPendOffers = 0, nPendCancels = 0, nPendTakes = 0;
+        CRITICAL_BLOCK(cs_mapDexOrders)
+        {
+            nPendOffers  = (int64_t)mapDexMempoolOffers.size();
+            nPendCancels = (int64_t)setDexMempoolCancels.size();
+            nPendTakes   = (int64_t)setDexMempoolTakes.size();
+        }
+        result.push_back(Pair("pending_sells",     nPendOffers));
+        result.push_back(Pair("pending_cancels",   nPendCancels));
+        result.push_back(Pair("pending_buys",      nPendTakes));
+    }
+    return result;
+}
+
+
 //
 // Call Table
 //
@@ -5267,6 +5813,14 @@ pair<string, rpcfn_type> pCallTable[] =
     make_pair("createatomrawtx",         &createatomrawtx),
     make_pair("sendatom",                &sendatom),
     make_pair("bridgeatomtosol",         &bridgeatomtosol),
+
+    make_pair("dexsell",                 &dexsell),
+    make_pair("dexbuy",                  &dexbuy),
+    make_pair("dextake",                 &dextake),
+    make_pair("dexcancel",               &dexcancel),
+    make_pair("dexorderbook",            &dexorderbook),
+    make_pair("dexmyorders",             &dexmyorders),
+    make_pair("dexinfo",                 &dexinfo),
 };
 map<string, rpcfn_type> mapCallTable(pCallTable, pCallTable + sizeof(pCallTable)/sizeof(pCallTable[0]));
 

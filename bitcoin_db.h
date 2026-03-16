@@ -11,6 +11,7 @@ class CUser;
 class CReview;
 class CAddress;
 class CWalletTx;
+struct CDexOrderEntry;
 
 extern map<string, string> mapAddressBook;
 extern CCriticalSection cs_mapAddressBook;
@@ -323,6 +324,11 @@ public:
 
     bool WriteAtomTotalMinted(int64 nTotal);
     bool ReadAtomTotalMinted(int64& nTotal);
+
+    bool WriteDexOrder(uint256 txhash, const CDexOrderEntry& entry);
+    bool ReadDexOrder(uint256 txhash, CDexOrderEntry& entry);
+    bool EraseDexOrder(uint256 txhash);
+    bool LoadAllDexOrders(std::map<uint256, CDexOrderEntry>& orders);
 };
 
 

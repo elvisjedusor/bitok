@@ -96,7 +96,6 @@ namespace Checkpoints
         (14000, uint256("0x10bb78b6ff9825b407f8d30e41f0aee7664759573382875dcf12bb947082c747"))
         (16000, uint256("0xf3506cfb336359ccba2245c630010fd387c7b9fc1c5102b75bb15d9680d3be60"))
         (18000, uint256("0x51bd3ac4edc1b47739987bf7f8657bd075850bb05e65fa6bf78597a9eb3462c2"))
-        (24000, uint256("0xb3ee323cbb36ab1938025dd3c138e02e6b27a6aac90d4684d5a5eaf77e021bd9"))
         ;
 
     bool CheckBlock(int nHeight, const uint256& hash)
@@ -939,6 +938,99 @@ bool CTransaction::AcceptTransaction(CTxDB& txdb, bool fCheckInputs, bool* pfMis
         }
     }
 
+    // DEX layer: validate DEX offer/cancel/take before accepting to mempool.
+    unsigned char nDexType = 0;
+    CAtomDexOffer dexOffer;
+    CAtomDexCancel dexCancel;
+    CAtomDexTake dexTake;
+    bool fHasDex = false;
+    if (nBestHeight + 1 >= ATOM_DEX_ACTIVATION_HEIGHT && !fHasAtom)
+        fHasDex = GetDexPayload(*this, nDexType, dexOffer, dexCancel, dexTake);
+
+    if (fHasDex)
+    {
+        if (nDexType == ATOM_TYPE_DEX_OFFER)
+        {
+            if (!VerifyAtomSender(*this, dexOffer.addrFrom))
+                return error("AcceptTransaction() : DEX_OFFER sender verification failed in tx %s",
+                             hash.ToString().substr(0, 6).c_str());
+
+            if (dexOffer.nSide != ATOM_DEX_SIDE_SELL_ATOM)
+                return error("AcceptTransaction() : DEX_OFFER only sell-side offers are supported in tx %s",
+                             hash.ToString().substr(0, 6).c_str());
+
+            int64 nAtomBal = 0;
+            uint32_t nConfirmedNonce = 0;
+            if (fCheckInputs)
+            {
+                CTxDB txdbDex("r");
+                txdbDex.ReadAtomBalance(dexOffer.addrFrom, nAtomBal, nConfirmedNonce);
+            }
+            if (!AtomMempoolCheckNonce(dexOffer.addrFrom, dexOffer.nNonce, nConfirmedNonce))
+                return error("AcceptTransaction() : DEX_OFFER nonce invalid in tx %s",
+                             hash.ToString().substr(0, 6).c_str());
+            int64 nAvailable = AtomGetEffectiveBalance(dexOffer.addrFrom, nAtomBal);
+            if (nAvailable < dexOffer.nAtomAmount)
+                return error("AcceptTransaction() : DEX_OFFER insufficient ATOM for sell in tx %s",
+                             hash.ToString().substr(0, 6).c_str());
+        }
+        else if (nDexType == ATOM_TYPE_DEX_CANCEL)
+        {
+            if (!VerifyAtomSender(*this, dexCancel.addrFrom))
+                return error("AcceptTransaction() : DEX_CANCEL sender verification failed in tx %s",
+                             hash.ToString().substr(0, 6).c_str());
+
+            CRITICAL_BLOCK(cs_mapDexOrders)
+            {
+                if (setDexMempoolCancels.count(dexCancel.hashOffer))
+                    return error("AcceptTransaction() : DEX_CANCEL duplicate: offer %s already has pending cancel in tx %s",
+                                 dexCancel.hashOffer.ToString().substr(0, 10).c_str(),
+                                 hash.ToString().substr(0, 6).c_str());
+                if (setDexMempoolTakes.count(dexCancel.hashOffer))
+                    return error("AcceptTransaction() : DEX_CANCEL rejected: offer %s has pending take in tx %s",
+                                 dexCancel.hashOffer.ToString().substr(0, 10).c_str(),
+                                 hash.ToString().substr(0, 6).c_str());
+
+                std::map<uint256, CDexOrderEntry>::iterator it = mapDexOrders.find(dexCancel.hashOffer);
+                if (it == mapDexOrders.end())
+                    return error("AcceptTransaction() : DEX_CANCEL references unknown offer %s in tx %s",
+                                 dexCancel.hashOffer.ToString().substr(0, 10).c_str(),
+                                 hash.ToString().substr(0, 6).c_str());
+                if (it->second.addrMaker != dexCancel.addrFrom)
+                    return error("AcceptTransaction() : DEX_CANCEL addrFrom does not match offer maker in tx %s",
+                                 hash.ToString().substr(0, 6).c_str());
+            }
+        }
+        else if (nDexType == ATOM_TYPE_DEX_TAKE)
+        {
+            if (!VerifyAtomSender(*this, dexTake.addrFrom))
+                return error("AcceptTransaction() : DEX_TAKE sender verification failed in tx %s",
+                             hash.ToString().substr(0, 6).c_str());
+
+            CRITICAL_BLOCK(cs_mapDexOrders)
+            {
+                if (setDexMempoolTakes.count(dexTake.hashOffer))
+                    return error("AcceptTransaction() : DEX_TAKE duplicate: offer %s already has pending take in tx %s",
+                                 dexTake.hashOffer.ToString().substr(0, 10).c_str(),
+                                 hash.ToString().substr(0, 6).c_str());
+                if (setDexMempoolCancels.count(dexTake.hashOffer))
+                    return error("AcceptTransaction() : DEX_TAKE rejected: offer %s has pending cancel in tx %s",
+                                 dexTake.hashOffer.ToString().substr(0, 10).c_str(),
+                                 hash.ToString().substr(0, 6).c_str());
+
+                std::map<uint256, CDexOrderEntry>::iterator it = mapDexOrders.find(dexTake.hashOffer);
+                if (it == mapDexOrders.end())
+                    return error("AcceptTransaction() : DEX_TAKE references unknown offer %s in tx %s",
+                                 dexTake.hashOffer.ToString().substr(0, 10).c_str(),
+                                 hash.ToString().substr(0, 6).c_str());
+
+                if (it->second.addrMaker == dexTake.addrFrom)
+                    return error("AcceptTransaction() : DEX_TAKE taker cannot be the maker in tx %s",
+                                 hash.ToString().substr(0, 6).c_str());
+            }
+        }
+    }
+
     // Store transaction in memory
     CRITICAL_BLOCK(cs_mapTransactions)
     {
@@ -954,6 +1046,16 @@ bool CTransaction::AcceptTransaction(CTxDB& txdb, bool fCheckInputs, bool* pfMis
     // If this is an ATOM transfer, register it in the mempool ATOM index
     if (fHasAtom)
         AtomMempoolAdd(hash, atomTransfer);
+
+    if (fHasDex)
+    {
+        if (nDexType == ATOM_TYPE_DEX_OFFER)
+            DexMempoolAddOffer(hash, dexOffer);
+        else if (nDexType == ATOM_TYPE_DEX_CANCEL)
+            DexMempoolAddCancel(hash, dexCancel.hashOffer);
+        else if (nDexType == ATOM_TYPE_DEX_TAKE)
+            DexMempoolAddTake(hash, dexTake.hashOffer);
+    }
 
     ///// are we sure this is ok when loading transactions or restoring block txes
     // If updated, erase old tx from wallet
@@ -1590,6 +1692,125 @@ bool CBlock::DisconnectBlock(CTxDB& txdb, CBlockIndex* pindex)
             }
         }
 
+        if (pindex->nHeight >= ATOM_DEX_ACTIVATION_HEIGHT)
+        {
+            unsigned char nDexType = 0;
+            CAtomDexOffer dexOffer;
+            CAtomDexCancel dexCancel;
+            CAtomDexTake dexTake;
+
+            if (GetDexPayload(tx, nDexType, dexOffer, dexCancel, dexTake))
+            {
+                if (nDexType == ATOM_TYPE_DEX_OFFER)
+                {
+                    int64 nBal = 0;
+                    uint32_t nNon = 0;
+                    txdb.ReadAtomBalance(dexOffer.addrFrom, nBal, nNon);
+                    nBal += dexOffer.nAtomAmount;
+                    if (nNon == dexOffer.nNonce && dexOffer.nNonce > 0)
+                        nNon = dexOffer.nNonce - 1;
+                    txdb.WriteAtomBalance(dexOffer.addrFrom, nBal, nNon);
+                    txdb.EraseDexOrder(txhash);
+                    CRITICAL_BLOCK(cs_mapDexOrders)
+                    {
+                        mapDexOrders.erase(txhash);
+                    }
+                }
+                else if (nDexType == ATOM_TYPE_DEX_CANCEL)
+                {
+                    CTransaction txOffer;
+                    if (txdb.ReadDiskTx(dexCancel.hashOffer, txOffer))
+                    {
+                        unsigned char nOfferType = 0;
+                        CAtomDexOffer origOffer;
+                        CAtomDexCancel ign1;
+                        CAtomDexTake ign2;
+                        if (GetDexPayload(txOffer, nOfferType, origOffer, ign1, ign2) &&
+                            nOfferType == ATOM_TYPE_DEX_OFFER)
+                        {
+                            int64 nBal = 0;
+                            uint32_t nNon = 0;
+                            txdb.ReadAtomBalance(origOffer.addrFrom, nBal, nNon);
+                            nBal -= origOffer.nAtomAmount;
+                            if (nBal < 0) nBal = 0;
+                            txdb.WriteAtomBalance(origOffer.addrFrom, nBal, nNon);
+
+                            CDexOrderEntry entry;
+                            entry.hashTx      = dexCancel.hashOffer;
+                            entry.addrMaker   = origOffer.addrFrom;
+                            entry.nSide       = origOffer.nSide;
+                            entry.nAtomAmount = origOffer.nAtomAmount;
+                            entry.nPrice      = origOffer.nPrice;
+                            entry.nNonce      = origOffer.nNonce;
+                            entry.nHeight     = 0;
+                            CTxIndex txindex;
+                            if (txdb.ReadTxIndex(dexCancel.hashOffer, txindex))
+                            {
+                                CBlock blk;
+                                if (blk.ReadFromDisk(txindex.pos.nFile, txindex.pos.nBlockPos, false))
+                                {
+                                    std::map<uint256, CBlockIndex*>::iterator bi = mapBlockIndex.find(blk.GetHash());
+                                    if (bi != mapBlockIndex.end())
+                                        entry.nHeight = bi->second->nHeight;
+                                }
+                            }
+                            txdb.WriteDexOrder(dexCancel.hashOffer, entry);
+                            CRITICAL_BLOCK(cs_mapDexOrders)
+                            {
+                                mapDexOrders[dexCancel.hashOffer] = entry;
+                            }
+                        }
+                    }
+                }
+                else if (nDexType == ATOM_TYPE_DEX_TAKE)
+                {
+                    CTransaction txOffer;
+                    if (txdb.ReadDiskTx(dexTake.hashOffer, txOffer))
+                    {
+                        unsigned char nOfferType = 0;
+                        CAtomDexOffer origOffer;
+                        CAtomDexCancel ign1;
+                        CAtomDexTake ign2;
+                        if (GetDexPayload(txOffer, nOfferType, origOffer, ign1, ign2) &&
+                            nOfferType == ATOM_TYPE_DEX_OFFER)
+                        {
+                            int64 nBalTaker = 0;
+                            uint32_t nNonTaker = 0;
+                            txdb.ReadAtomBalance(dexTake.addrFrom, nBalTaker, nNonTaker);
+                            nBalTaker -= origOffer.nAtomAmount;
+                            if (nBalTaker < 0) nBalTaker = 0;
+                            txdb.WriteAtomBalance(dexTake.addrFrom, nBalTaker, nNonTaker);
+
+                            CDexOrderEntry entry;
+                            entry.hashTx      = dexTake.hashOffer;
+                            entry.addrMaker   = origOffer.addrFrom;
+                            entry.nSide       = origOffer.nSide;
+                            entry.nAtomAmount = origOffer.nAtomAmount;
+                            entry.nPrice      = origOffer.nPrice;
+                            entry.nNonce      = origOffer.nNonce;
+                            entry.nHeight     = 0;
+                            CTxIndex txindex;
+                            if (txdb.ReadTxIndex(dexTake.hashOffer, txindex))
+                            {
+                                CBlock blk;
+                                if (blk.ReadFromDisk(txindex.pos.nFile, txindex.pos.nBlockPos, false))
+                                {
+                                    std::map<uint256, CBlockIndex*>::iterator bi = mapBlockIndex.find(blk.GetHash());
+                                    if (bi != mapBlockIndex.end())
+                                        entry.nHeight = bi->second->nHeight;
+                                }
+                            }
+                            txdb.WriteDexOrder(dexTake.hashOffer, entry);
+                            CRITICAL_BLOCK(cs_mapDexOrders)
+                            {
+                                mapDexOrders[dexTake.hashOffer] = entry;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if (!vtx[i].DisconnectInputs(txdb))
             return false;
     }
@@ -1777,6 +1998,172 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex)
                              txhash.ToString().substr(0, 10).c_str());
 
             AtomMempoolRemove(txhash);
+        }
+
+        // DEX processing: handle offer/cancel/take operations
+        if (pindex->nHeight >= ATOM_DEX_ACTIVATION_HEIGHT)
+        {
+            unsigned char nDexType = 0;
+            CAtomDexOffer dexOffer;
+            CAtomDexCancel dexCancel;
+            CAtomDexTake dexTake;
+
+            if (GetDexPayload(tx, nDexType, dexOffer, dexCancel, dexTake))
+            {
+                if (nDexType == ATOM_TYPE_DEX_OFFER)
+                {
+                    if (!VerifyAtomSender(tx, dexOffer.addrFrom))
+                        return error("ConnectBlock() : DEX_OFFER sender verification failed in tx %s",
+                                     txhash.ToString().substr(0, 10).c_str());
+
+                    if (dexOffer.nSide != ATOM_DEX_SIDE_SELL_ATOM)
+                        return error("ConnectBlock() : DEX_OFFER only sell-side supported in tx %s",
+                                     txhash.ToString().substr(0, 10).c_str());
+
+                    if (DexComputeBitokPayment(dexOffer.nAtomAmount, dexOffer.nPrice) <= 0)
+                        return error("ConnectBlock() : DEX_OFFER total BITOK payment is zero in tx %s",
+                                     txhash.ToString().substr(0, 10).c_str());
+
+                    {
+                        int64 nBalFrom = 0;
+                        uint32_t nNonceFrom = 0;
+                        txdb.ReadAtomBalance(dexOffer.addrFrom, nBalFrom, nNonceFrom);
+                        if (dexOffer.nNonce <= nNonceFrom)
+                            return error("ConnectBlock() : DEX_OFFER nonce too low in tx %s",
+                                         txhash.ToString().substr(0, 10).c_str());
+                        if (dexOffer.nNonce > nNonceFrom + ATOM_MAX_NONCE_GAP)
+                            return error("ConnectBlock() : DEX_OFFER nonce gap too large in tx %s",
+                                         txhash.ToString().substr(0, 10).c_str());
+                        if (nBalFrom < dexOffer.nAtomAmount)
+                            return error("ConnectBlock() : DEX_OFFER insufficient ATOM in tx %s",
+                                         txhash.ToString().substr(0, 10).c_str());
+
+                        nBalFrom -= dexOffer.nAtomAmount;
+                        nNonceFrom = dexOffer.nNonce;
+                        txdb.WriteAtomBalance(dexOffer.addrFrom, nBalFrom, nNonceFrom);
+                    }
+
+                    CDexOrderEntry entry;
+                    entry.hashTx      = txhash;
+                    entry.addrMaker   = dexOffer.addrFrom;
+                    entry.nSide       = dexOffer.nSide;
+                    entry.nAtomAmount = dexOffer.nAtomAmount;
+                    entry.nPrice      = dexOffer.nPrice;
+                    entry.nNonce      = dexOffer.nNonce;
+                    entry.nHeight     = pindex->nHeight;
+                    entry.nTime       = pindex->nTime;
+
+                    txdb.WriteDexOrder(txhash, entry);
+
+                    CRITICAL_BLOCK(cs_mapDexOrders)
+                    {
+                        mapDexOrders[txhash] = entry;
+                    }
+
+                    DexMempoolRemove(txhash);
+                }
+                else if (nDexType == ATOM_TYPE_DEX_CANCEL)
+                {
+                    if (!VerifyAtomSender(tx, dexCancel.addrFrom))
+                        return error("ConnectBlock() : DEX_CANCEL sender verification failed in tx %s",
+                                     txhash.ToString().substr(0, 10).c_str());
+
+                    CDexOrderEntry cancelledOrder;
+                    bool fFound = false;
+                    CRITICAL_BLOCK(cs_mapDexOrders)
+                    {
+                        std::map<uint256, CDexOrderEntry>::iterator it = mapDexOrders.find(dexCancel.hashOffer);
+                        if (it != mapDexOrders.end())
+                        {
+                            if (it->second.addrMaker != dexCancel.addrFrom)
+                                return error("ConnectBlock() : DEX_CANCEL maker mismatch in tx %s",
+                                             txhash.ToString().substr(0, 10).c_str());
+                            cancelledOrder = it->second;
+                            fFound = true;
+                        }
+                    }
+
+                    if (!fFound)
+                        return error("ConnectBlock() : DEX_CANCEL references non-existent offer in tx %s",
+                                     txhash.ToString().substr(0, 10).c_str());
+
+                    {
+                        int64 nBal = 0;
+                        uint32_t nNon = 0;
+                        txdb.ReadAtomBalance(cancelledOrder.addrMaker, nBal, nNon);
+                        nBal += cancelledOrder.nAtomAmount;
+                        txdb.WriteAtomBalance(cancelledOrder.addrMaker, nBal, nNon);
+
+                        txdb.EraseDexOrder(dexCancel.hashOffer);
+
+                        CRITICAL_BLOCK(cs_mapDexOrders)
+                        {
+                            mapDexOrders.erase(dexCancel.hashOffer);
+                        }
+                    }
+
+                    DexMempoolRemove(txhash);
+                }
+                else if (nDexType == ATOM_TYPE_DEX_TAKE)
+                {
+                    if (!VerifyAtomSender(tx, dexTake.addrFrom))
+                        return error("ConnectBlock() : DEX_TAKE sender verification failed in tx %s",
+                                     txhash.ToString().substr(0, 10).c_str());
+
+                    CDexOrderEntry takenOrder;
+                    bool fFound = false;
+                    CRITICAL_BLOCK(cs_mapDexOrders)
+                    {
+                        std::map<uint256, CDexOrderEntry>::iterator it = mapDexOrders.find(dexTake.hashOffer);
+                        if (it != mapDexOrders.end())
+                        {
+                            if (it->second.addrMaker == dexTake.addrFrom)
+                                return error("ConnectBlock() : DEX_TAKE taker is maker in tx %s",
+                                             txhash.ToString().substr(0, 10).c_str());
+                            takenOrder = it->second;
+                            fFound = true;
+                        }
+                    }
+
+                    if (!fFound)
+                        return error("ConnectBlock() : DEX_TAKE references non-existent offer in tx %s",
+                                     txhash.ToString().substr(0, 10).c_str());
+
+                    {
+                        int64 nRequiredBitok = DexComputeBitokPayment(takenOrder.nAtomAmount, takenOrder.nPrice);
+                        if (nRequiredBitok <= 0)
+                            return error("ConnectBlock() : DEX_TAKE computed BITOK payment is zero in tx %s",
+                                         txhash.ToString().substr(0, 10).c_str());
+                        int64 nPaidToMaker = 0;
+                        for (unsigned int vo = 0; vo < tx.vout.size(); vo++)
+                        {
+                            uint160 addrOut;
+                            if (GetScriptAddr(tx.vout[vo].scriptPubKey, addrOut) &&
+                                addrOut == takenOrder.addrMaker)
+                                nPaidToMaker += tx.vout[vo].nValue;
+                        }
+                        if (nPaidToMaker < nRequiredBitok)
+                            return error("ConnectBlock() : DEX_TAKE insufficient BITOK payment: paid %" PRI64d " need %" PRI64d " in tx %s",
+                                         nPaidToMaker, nRequiredBitok,
+                                         txhash.ToString().substr(0, 10).c_str());
+
+                        int64 nBalTaker = 0;
+                        uint32_t nNonceTaker = 0;
+                        txdb.ReadAtomBalance(dexTake.addrFrom, nBalTaker, nNonceTaker);
+                        nBalTaker += takenOrder.nAtomAmount;
+                        txdb.WriteAtomBalance(dexTake.addrFrom, nBalTaker, nNonceTaker);
+                    }
+
+                    txdb.EraseDexOrder(dexTake.hashOffer);
+
+                    CRITICAL_BLOCK(cs_mapDexOrders)
+                    {
+                        mapDexOrders.erase(dexTake.hashOffer);
+                    }
+
+                    DexMempoolRemove(txhash);
+                }
+            }
         }
     }
 

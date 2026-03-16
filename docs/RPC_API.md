@@ -23,8 +23,9 @@ JSON-RPC 1.0 interface. Run `./bitokd help` to list all commands from the runnin
 15. [Key Management](#key-management)
 16. [Stealth Address Operations](#stealth-address-operations)
 17. [ATOM Operations](#atom-operations)
-18. [Error Handling](#error-handling)
-19. [Client Examples](#client-examples)
+18. [DEX Operations](#dex-operations)
+19. [Error Handling](#error-handling)
+20. [Client Examples](#client-examples)
 
 ---
 
@@ -1766,6 +1767,256 @@ Bridge ATOM from the local wallet to a Solana address. Burns ATOM on the Bitok c
 ```
 
 No `to` field is returned — the ATOM is burned on Bitok, not sent to any Bitok address. Funds are drawn from the wallet address with the largest spendable ATOM balance.
+
+---
+
+## DEX Operations
+
+The built-in peer-to-peer exchange for trading ATOM against BITOK. Fully atomic, consensus-enforced settlement with no trusted intermediary. Active at block height 25000 (`ATOM_DEX_ACTIVATION_HEIGHT`).
+
+See [DEX.md](DEX.md) for the full protocol specification, wire formats, and settlement mechanics.
+
+---
+
+### dexsell
+
+Place a sell order. Your ATOM is escrowed on-chain when the transaction is mined and remains locked until the order is taken or cancelled.
+
+**Parameters:**
+1. `atom_amount` (number, required) — ATOM quantity to sell (e.g. `100.5`)
+2. `price` (number, required) — ask price in BITOK per 1 ATOM (e.g. `0.05`)
+
+**Behavior:**
+- Finds the wallet address with the highest spendable ATOM balance
+- Validates `atom_amount` is covered by available balance (confirmed minus pending transfers and existing DEX escrows)
+- Selects next nonce: `max(confirmedNonce+1, highestPendingNonce+1)`
+- Broadcasts a `DEX_OFFER` transaction (62-byte OP_RETURN payload)
+- ATOM is debited from the maker's account when the block is mined, not at broadcast
+
+**Returns:**
+```json
+{
+  "txid":        "abc123...",
+  "from":        "1MakerAddr...",
+  "atom_amount": 100.5,
+  "price":       0.05,
+  "total_bitok": 5.025,
+  "nonce":       7,
+  "status":      "pending"
+}
+```
+
+- `total_bitok` — BITOK a buyer will pay: `(atom_amount × price)`
+- `status` — always `"pending"` until mined
+
+```bash
+./bitokd dexsell 100.5 0.05
+```
+
+**Errors:** Invalid amount/price, no wallet addresses with ATOM, insufficient spendable ATOM, transaction creation failure.
+
+---
+
+### dexcancel
+
+Cancel an open sell order. The escrowed ATOM is returned to your account when the cancellation is mined.
+
+**Parameters:**
+1. `offer_txid` (string, required) — transaction ID of the `DEX_OFFER` to cancel
+
+**Behavior:**
+- Looks up the offer in the open order book (`mapDexOrders`)
+- Verifies a wallet key owns the order (maker address must match a wallet key)
+- Broadcasts a `DEX_CANCEL` transaction (58-byte OP_RETURN payload)
+- Rejected if a take or another cancel for this offer is already pending in the mempool
+
+**Returns:**
+```json
+{
+  "txid":      "abc123...",
+  "cancelled": "offer_txid...",
+  "status":    "pending"
+}
+```
+
+```bash
+./bitokd dexcancel "offer_txid..."
+```
+
+**Errors:** Offer not found, caller is not the maker, duplicate cancel/take already pending.
+
+---
+
+### dexbuy
+
+Buy ATOM from the cheapest available sell order. Automatically selects the best-priced matching order.
+
+**Parameters:**
+1. `atom_amount` (number, required) — minimum ATOM to buy. Use `0` to take the cheapest order regardless of size; if > 0 only orders with at least this amount are considered
+2. `max_price` (number, optional) — maximum price in BITOK per ATOM; orders above this are ignored
+
+**Order selection:**
+- Considers only `SELL_ATOM` orders
+- Skips orders with a pending take or cancel in the mempool
+- Selects cheapest (lowest price); ties broken by smallest order size
+
+**Behavior:**
+- Computes BITOK payment: `(order.atom_amount × order.price)`
+- Verifies wallet has sufficient BITOK
+- Broadcasts a `DEX_TAKE` transaction with a BITOK output to the maker's address
+- ATOM is credited to the taker when the block is mined
+
+**Returns:**
+```json
+{
+  "txid":          "abc123...",
+  "offer_taken":   "offer_txid...",
+  "taker":         "1TakerAddr...",
+  "atom_received": 100.5,
+  "bitok_paid":    5.025,
+  "price":         0.05,
+  "status":        "pending"
+}
+```
+
+```bash
+./bitokd dexbuy 100 0.06
+./bitokd dexbuy 0
+```
+
+**Errors:** Invalid parameters, no matching order found, insufficient BITOK, transaction creation failure.
+
+---
+
+### dextake
+
+Take a specific sell order by its transaction ID. Identical to `dexbuy` but targets an exact offer rather than finding the best price.
+
+**Parameters:**
+1. `offer_txid` (string, required) — transaction ID of the `DEX_OFFER` to fill
+
+**Behavior:**
+- Looks up the specific offer in `mapDexOrders`
+- Finds a wallet address that is not the maker
+- Verifies sufficient BITOK balance
+- Broadcasts `DEX_TAKE` transaction
+
+**Returns:** Same structure as `dexbuy`.
+
+```bash
+./bitokd dextake "offer_txid..."
+```
+
+**Errors:** Offer not found or already taken/cancelled, no suitable wallet address, insufficient BITOK.
+
+---
+
+### dexorderbook
+
+List all open sell orders, sorted by price ascending (cheapest first).
+
+**Parameters:** None
+
+**Returns:**
+```json
+{
+  "orders": [
+    {
+      "txid":        "abc123...",
+      "seller":      "1MakerAddr...",
+      "atom_amount": 100.0,
+      "price":       0.05,
+      "total_bitok": 5.0,
+      "height":      25100
+    },
+    {
+      "txid":        "def456...",
+      "seller":      "1OtherAddr...",
+      "atom_amount": 50.0,
+      "price":       0.06,
+      "total_bitok": 3.0,
+      "height":      25200
+    }
+  ],
+  "total_count": 2
+}
+```
+
+- `total_bitok` — BITOK cost to fill this order at its listed price
+- `height` — block height at which the offer was confirmed
+
+```bash
+./bitokd dexorderbook
+```
+
+Always succeeds; returns `total_count: 0` and empty array if no orders are open.
+
+---
+
+### dexmyorders
+
+List your own open sell orders. Only returns orders where the maker address matches a key in your wallet.
+
+**Parameters:** None
+
+**Returns:** Array of order objects:
+```json
+[
+  {
+    "txid":        "abc123...",
+    "address":     "1MakerAddr...",
+    "atom_amount": 100.0,
+    "price":       0.05,
+    "total_bitok": 5.0,
+    "height":      25100
+  }
+]
+```
+
+```bash
+./bitokd dexmyorders
+```
+
+Always succeeds; returns empty array if you have no open orders.
+
+---
+
+### dexinfo
+
+DEX statistics and current parameters.
+
+**Parameters:** None
+
+**Returns:**
+```json
+{
+  "activation_height":  25000,
+  "open_orders":        42,
+  "total_atom":         12345.5,
+  "total_bitok_value":  617.275,
+  "cheapest_ask":       0.045,
+  "pending_sells":      3,
+  "pending_cancels":    1,
+  "pending_buys":       2
+}
+```
+
+| Field | Description |
+|---|---|
+| `activation_height` | Block height DEX became active (always 25000) |
+| `open_orders` | Number of confirmed open sell orders |
+| `total_atom` | Sum of all escrowed ATOM across open orders |
+| `total_bitok_value` | Total BITOK value of all open orders at their listed prices |
+| `cheapest_ask` | Lowest price in BITOK/ATOM across all open orders; `null` if no orders |
+| `pending_sells` | `DEX_OFFER` transactions in mempool (unconfirmed) |
+| `pending_cancels` | `DEX_CANCEL` transactions in mempool |
+| `pending_buys` | `DEX_TAKE` transactions in mempool |
+
+```bash
+./bitokd dexinfo
+```
+
+Always succeeds.
 
 ---
 

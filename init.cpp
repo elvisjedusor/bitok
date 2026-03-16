@@ -1120,6 +1120,19 @@ bool AppInit(int argc, char* argv[])
         }
     }
 
+    {
+        CTxDB txdb("r");
+        std::map<uint256, CDexOrderEntry> orders;
+        txdb.LoadAllDexOrders(orders);
+        txdb.Close();
+        CRITICAL_BLOCK(cs_mapDexOrders)
+        {
+            mapDexOrders = orders;
+        }
+        if (!orders.empty())
+            printf("[DEX] Loaded %u open orders from database\n", (unsigned int)orders.size());
+    }
+
     printf("Done loading\n");
 
     if (GetBoolArg("-printblockindex") || GetBoolArg("-printblocktree"))

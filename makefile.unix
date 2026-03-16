@@ -239,6 +239,7 @@ OBJS_RELEASE_DAEMON = \
     obj/release/rpc.o \
     obj/release/init.o \
     obj/release/stealth.o \
+    obj/release/atom.o \
     obj/release/sha.o \
     obj/release/crypto/sha256.o \
     obj/release/crypto/sha256_shani.o \
@@ -259,6 +260,7 @@ OBJS_RELEASE_GUI = \
     obj/release-gui/ui.o \
     obj/release-gui/uibase.o \
     obj/release-gui/stealth.o \
+    obj/release-gui/atom.o \
     obj/release-gui/sha.o \
     obj/release-gui/crypto/sha256.o \
     obj/release-gui/crypto/sha256_shani.o \

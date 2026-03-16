@@ -1,8 +1,7 @@
-# ATOM — Continuing Satoshi's Vision
-
+# ATOM. The Lost Bitcoin Layer
 ## The Origin: Satoshi's Atoms and Trust
 
-In November 2008, weeks before Bitcoin's public launch, Satoshi Nakamoto drafted a pre-release version of the Bitcoin source code that never reached public release. Researcher Francis Pouliot discovered this code in 2019. It contained several notable concepts including the **"atoms"** tied to **"user address"**, widely interpreted as a node reputation or trust scoring system
+In November 2008, weeks before Bitcoin's public launch, Satoshi Nakamoto drafted a pre-release version of the Bitcoin source code that never reached public release. Researcher Francis Pouliot discovered this code in 2019. It contained several notable concepts including **"atoms"** tied to **"user address"** - widely interpreted as a node reputation or trust scoring system
 
 Satoshi built trust-minimisation into every layer of early Bitcoin.
 
@@ -19,7 +18,7 @@ But this creates a fundamental tension with any trust or reputation system built
 
 **A miner cannot accumulate atoms and build trust because each block reward goes to a new address.** Satoshi's design, brilliant for privacy, made the atoms concept unworkable in its original non-transferable form.
 
-## My Fix: Transferable Atoms
+## Transferable Atoms
 
 I am continuing Satoshi's work by solving this gap. ATOM on Bitok is the completion of what Satoshi sketched but left unfinished.
 
@@ -34,7 +33,7 @@ This is the minimum change needed to make the concept viable. The rest of the de
 
 ---
 
-## ATOM — The power of trust.
+## ATOM. The power of trust.
 
 ATOM is a native token layer built directly on the Bitok blockchain. Every ATOM transfer is a regular Bitok transaction. ATOM state is maintained by every full node unconditionally — no special mode required.
 
@@ -355,7 +354,6 @@ ATOM exists on both Bitok (native L1) and Solana (wrapped SPL token). The bridge
 The bridge address check in both `AcceptTransaction` and `ConnectBlock` ensures that no node — honest or malicious — can mine a block containing an unauthorised mint.
 
 ```cpp
-// atom.h — HASH160 of bridge operator key (address: 1BE3AJdLVeDJZ5mH8SSuXCqpnCswxK7DDp)
 static const unsigned char ATOM_BRIDGE_HASH[20] = {
     0x70, 0x28, 0x78, 0x00, 0xce, 0x12, 0x3d, 0x72, 0x16, 0xb8,
     0x8d, 0x69, 0xe0, 0x8f, 0xa0, 0x1c, 0x32, 0x04, 0xce, 0xd2

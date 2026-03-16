@@ -36,6 +36,9 @@ static const unsigned char ATOM_TYPE_TRANSFER      = 0x01; // user-sendable: mov
 static const unsigned char ATOM_TYPE_BRIDGE_TO_SOL = 0x03; // user-sendable: bridge ATOM to Solana
 static const unsigned char ATOM_TYPE_COINBASE      = 0x04; // INTERNAL: only written by ConnectBlock
 static const unsigned char ATOM_TYPE_BRIDGE_TO_BITOK = 0x05; // bridge-only: mint ATOM from Solana side
+static const unsigned char ATOM_TYPE_DEX_OFFER      = 0x06; // P2P DEX: place sell order (ATOM for BITOK)
+static const unsigned char ATOM_TYPE_DEX_CANCEL      = 0x07; // P2P DEX: cancel an open order
+static const unsigned char ATOM_TYPE_DEX_TAKE         = 0x08; // P2P DEX: take (fill) an existing order
 
 // Bridge address: only this address may broadcast ATOM_TYPE_BRIDGE_TO_BITOK transactions.
 // HASH160 of bridge
@@ -58,6 +61,12 @@ static const int64 ATOM_MAX_SUPPLY         = 1000000000LL * ATOM_DECIMALS; // 1,
 static const int64 ATOM_PER_BITOK = 20LL * ATOM_DECIMALS; // raw ATOM units per 1 COIN
 
 static const uint32_t ATOM_MAX_NONCE_GAP = 100;
+
+static const int  ATOM_DEX_ACTIVATION_HEIGHT = 25000;
+static const int  ATOM_DEX_OFFER_PAYLOAD_SIZE  = 62;
+static const int  ATOM_DEX_CANCEL_PAYLOAD_SIZE = 58;
+static const int  ATOM_DEX_TAKE_PAYLOAD_SIZE   = 58;
+static const unsigned char ATOM_DEX_SIDE_SELL_ATOM = 0x00;
 
 struct CAtomTransfer
 {
@@ -97,6 +106,123 @@ struct CAtomTransfer
         READWRITE(addrTo);
         READWRITE(nAmount);
         READWRITE(nNonce);
+    )
+};
+
+// ---------------------------------------------------------------------------
+// DEX Order payload formats:
+//
+// DEX_OFFER (62 bytes):
+//   [0..3]   magic     4 bytes   0x41544f4d
+//   [4]      version   1 byte    0x01
+//   [5]      type      1 byte    0x06
+//   [6..25]  from      20 bytes  HASH160(maker pubkey)
+//   [26]     side      1 byte    0x00=sell_atom (only sell supported)
+//   [27..34] atom_qty  8 bytes   ATOM amount in base units, big-endian
+//   [35..42] price     8 bytes   BITOK satoshi per 1 ATOM (base unit), big-endian
+//   [43..46] nonce     4 bytes   per-sender monotonic counter, big-endian
+//   [47..61] reserved  15 bytes  zero (future use)
+//
+// DEX_CANCEL (58 bytes):
+//   [0..3]   magic     4 bytes
+//   [4]      version   1 byte    0x01
+//   [5]      type      1 byte    0x07
+//   [6..25]  from      20 bytes  HASH160(maker pubkey) — must match original offer
+//   [26..57] offer_tx  32 bytes  txhash of the DEX_OFFER being cancelled
+//
+// DEX_TAKE (58 bytes):
+//   [0..3]   magic     4 bytes
+//   [4]      version   1 byte    0x01
+//   [5]      type      1 byte    0x08
+//   [6..25]  from      20 bytes  HASH160(taker pubkey)
+//   [26..57] offer_tx  32 bytes  txhash of the DEX_OFFER being taken
+//
+// Settlement: when DEX_TAKE is mined, ConnectBlock atomically:
+//   debit maker ATOM (escrowed at offer time), credit taker ATOM;
+//   taker pays BITOK to maker via tx outputs (validated in consensus)
+// ---------------------------------------------------------------------------
+
+struct CAtomDexOffer
+{
+    unsigned char nVersion;
+    unsigned char nType;
+    uint160       addrFrom;
+    unsigned char nSide;
+    int64         nAtomAmount;
+    int64         nPrice;
+    uint32_t      nNonce;
+
+    CAtomDexOffer() : nVersion(ATOM_VERSION), nType(ATOM_TYPE_DEX_OFFER),
+                      addrFrom(0), nSide(ATOM_DEX_SIDE_SELL_ATOM),
+                      nAtomAmount(0), nPrice(0), nNonce(0) {}
+
+    bool IsValid() const
+    {
+        return (nVersion == ATOM_VERSION &&
+                nType == ATOM_TYPE_DEX_OFFER &&
+                nSide == ATOM_DEX_SIDE_SELL_ATOM &&
+                nAtomAmount > 0 && nAtomAmount <= ATOM_MAX_SUPPLY &&
+                nPrice > 0);
+    }
+
+    IMPLEMENT_SERIALIZE(
+        READWRITE(nVersion);
+        READWRITE(nType);
+        READWRITE(addrFrom);
+        READWRITE(nSide);
+        READWRITE(nAtomAmount);
+        READWRITE(nPrice);
+        READWRITE(nNonce);
+    )
+};
+
+struct CAtomDexCancel
+{
+    unsigned char nVersion;
+    unsigned char nType;
+    uint160       addrFrom;
+    uint256       hashOffer;
+
+    CAtomDexCancel() : nVersion(ATOM_VERSION), nType(ATOM_TYPE_DEX_CANCEL),
+                       addrFrom(0), hashOffer(0) {}
+
+    bool IsValid() const
+    {
+        return (nVersion == ATOM_VERSION &&
+                nType == ATOM_TYPE_DEX_CANCEL &&
+                hashOffer != 0);
+    }
+
+    IMPLEMENT_SERIALIZE(
+        READWRITE(nVersion);
+        READWRITE(nType);
+        READWRITE(addrFrom);
+        READWRITE(hashOffer);
+    )
+};
+
+struct CAtomDexTake
+{
+    unsigned char nVersion;
+    unsigned char nType;
+    uint160       addrFrom;
+    uint256       hashOffer;
+
+    CAtomDexTake() : nVersion(ATOM_VERSION), nType(ATOM_TYPE_DEX_TAKE),
+                     addrFrom(0), hashOffer(0) {}
+
+    bool IsValid() const
+    {
+        return (nVersion == ATOM_VERSION &&
+                nType == ATOM_TYPE_DEX_TAKE &&
+                hashOffer != 0);
+    }
+
+    IMPLEMENT_SERIALIZE(
+        READWRITE(nVersion);
+        READWRITE(nType);
+        READWRITE(addrFrom);
+        READWRITE(hashOffer);
     )
 };
 
@@ -140,5 +266,76 @@ int64 AtomGetEffectiveBalance(const uint160& addr, int64 nConfirmedBalance);
 // Hash160 matches addrFrom.  Prevents ATOM theft via forged addrFrom fields.
 // For coinbase transactions (no real inputs) this always returns false.
 bool VerifyAtomSender(const CTransaction& tx, const uint160& addrFrom);
+
+inline int64 DexComputeBitokPayment(int64 nAtomAmount, int64 nPrice)
+{
+    __int128 n = (__int128)nAtomAmount * (__int128)nPrice;
+    int64 result = (int64)(n / ATOM_DECIMALS);
+    if (result < 0) result = 0;
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// DEX payload encode/decode
+// ---------------------------------------------------------------------------
+bool EncodeDexOfferPayload(const CAtomDexOffer& offer, std::vector<unsigned char>& vchOut);
+bool DecodeDexOfferPayload(const std::vector<unsigned char>& vch, CAtomDexOffer& offer);
+bool EncodeDexCancelPayload(const CAtomDexCancel& cancel, std::vector<unsigned char>& vchOut);
+bool DecodeDexCancelPayload(const std::vector<unsigned char>& vch, CAtomDexCancel& cancel);
+bool EncodeDexTakePayload(const CAtomDexTake& take, std::vector<unsigned char>& vchOut);
+bool DecodeDexTakePayload(const std::vector<unsigned char>& vch, CAtomDexTake& take);
+
+CScript BuildDexOfferScript(const CAtomDexOffer& offer);
+CScript BuildDexCancelScript(const CAtomDexCancel& cancel);
+CScript BuildDexTakeScript(const CAtomDexTake& take);
+
+bool ParseDexScript(const CScript& script, unsigned char& nTypeOut,
+                    CAtomDexOffer& offer, CAtomDexCancel& cancel, CAtomDexTake& take);
+bool GetDexPayload(const CTransaction& tx, unsigned char& nTypeOut,
+                   CAtomDexOffer& offer, CAtomDexCancel& cancel, CAtomDexTake& take);
+
+// ---------------------------------------------------------------------------
+// DEX order book (in-memory, rebuilt from DB on startup)
+// ---------------------------------------------------------------------------
+struct CDexOrderEntry
+{
+    uint256       hashTx;
+    uint160       addrMaker;
+    unsigned char nSide;
+    int64         nAtomAmount;
+    int64         nPrice;
+    uint32_t      nNonce;
+    int           nHeight;
+    unsigned int  nTime;
+
+    CDexOrderEntry() : hashTx(0), addrMaker(0), nSide(0),
+                       nAtomAmount(0), nPrice(0), nNonce(0), nHeight(0), nTime(0) {}
+
+    IMPLEMENT_SERIALIZE(
+        READWRITE(hashTx);
+        READWRITE(addrMaker);
+        READWRITE(nSide);
+        READWRITE(nAtomAmount);
+        READWRITE(nPrice);
+        READWRITE(nNonce);
+        READWRITE(nHeight);
+        READWRITE(nTime);
+    )
+};
+
+extern CCriticalSection cs_mapDexOrders;
+extern std::map<uint256, CDexOrderEntry> mapDexOrders;
+extern std::map<uint256, CAtomDexOffer> mapDexMempoolOffers;
+extern std::set<uint256> setDexMempoolCancels;
+extern std::set<uint256> setDexMempoolTakes;
+extern std::map<uint256, uint256> mapDexMempoolCancelTx;
+extern std::map<uint256, uint256> mapDexMempoolTakeTx;
+
+void DexMempoolAddOffer(const uint256& txhash, const CAtomDexOffer& offer);
+void DexMempoolAddCancel(const uint256& txhash, const uint256& hashOffer);
+void DexMempoolAddTake(const uint256& txhash, const uint256& hashOffer);
+bool DexMempoolHasCancelForOffer(const uint256& hashOffer);
+bool DexMempoolHasTakeForOffer(const uint256& hashOffer);
+void DexMempoolRemove(const uint256& txhash);
 
 #endif // ATOM_H

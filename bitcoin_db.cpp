@@ -1428,6 +1428,70 @@ bool CTxDB::ReadAtomTotalMinted(int64& nTotal)
 }
 
 
+// ---------------------------------------------------------------------------
+// DEX order DB methods
+// ---------------------------------------------------------------------------
+
+bool CTxDB::WriteDexOrder(uint256 txhash, const CDexOrderEntry& entry)
+{
+    return Write(make_pair(string("dexorder"), txhash), entry);
+}
+
+bool CTxDB::ReadDexOrder(uint256 txhash, CDexOrderEntry& entry)
+{
+    return Read(make_pair(string("dexorder"), txhash), entry);
+}
+
+bool CTxDB::EraseDexOrder(uint256 txhash)
+{
+    return Erase(make_pair(string("dexorder"), txhash));
+}
+
+bool CTxDB::LoadAllDexOrders(std::map<uint256, CDexOrderEntry>& orders)
+{
+    orders.clear();
+
+    Dbc* pcursor = GetCursor();
+    if (!pcursor)
+        return false;
+
+    CDataStream ssKey;
+    ssKey << string("dexorder");
+    unsigned int fFlags = DB_SET_RANGE;
+
+    loop
+    {
+        CDataStream ssKeyRet;
+        if (fFlags == DB_SET_RANGE)
+            ssKeyRet = ssKey;
+        CDataStream ssValue;
+        int ret = ReadAtCursor(pcursor, ssKeyRet, ssValue, fFlags);
+        fFlags = DB_NEXT;
+        if (ret == DB_NOTFOUND)
+            break;
+        else if (ret != 0)
+        {
+            pcursor->close();
+            return false;
+        }
+
+        string strType;
+        uint256 txhash;
+        try { ssKeyRet >> strType >> txhash; } catch (...) { break; }
+        if (strType != "dexorder")
+            break;
+
+        CDexOrderEntry entry;
+        try { ssValue >> entry; } catch (...) { continue; }
+
+        orders[txhash] = entry;
+    }
+
+    pcursor->close();
+    return true;
+}
+
+
 CBlockIndex* InsertBlockIndex(uint256 hash)
 {
     if (hash == 0)
