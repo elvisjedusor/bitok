@@ -4252,7 +4252,7 @@ Value getatombalance(const Array& params, bool fHelp)
     if (fHelp || params.size() != 0)
         throw runtime_error(
             "getatombalance\n"
-            "Returns the wallet's total confirmed ATOM balance.");
+            "Returns the wallet's total spendable ATOM balance (confirmed minus pending outbound).");
 
     int64 nTotal = 0;
     CTxDB txdb("r");
@@ -4266,7 +4266,7 @@ Value getatombalance(const Array& params, bool fHelp)
             int64 nConfirmed = 0;
             uint32_t nNonceIgnored = 0;
             txdb.ReadAtomBalance(hash160, nConfirmed, nNonceIgnored);
-            nTotal += nConfirmed;
+            nTotal += AtomGetEffectiveBalance(hash160, nConfirmed);
         }
     }
 
@@ -4533,6 +4533,55 @@ Value getatomhistory(const Array& params, bool fHelp)
 }
 
 
+static bool HasSignerUtxo(const uint160& h160)
+{
+    CRITICAL_BLOCK(cs_mapWallet)
+    {
+        for (map<uint256, CWalletTx>::iterator it = mapWallet.begin(); it != mapWallet.end(); ++it)
+        {
+            CWalletTx* pcoin = &(*it).second;
+            if (!pcoin->IsFinal() || pcoin->fSpent)
+                continue;
+            if (!pcoin->IsInMainChain())
+            {
+                bool fInMempool = false;
+                CRITICAL_BLOCK(cs_mapTransactions)
+                    fInMempool = mapTransactions.count(pcoin->GetHash()) != 0;
+                if (!fInMempool)
+                    continue;
+            }
+            uint256 hash = pcoin->GetHash();
+            for (int nOut = 0; nOut < pcoin->vout.size(); nOut++)
+            {
+                if (!pcoin->vout[nOut].IsMine() || IsOutputSpent(hash, nOut))
+                    continue;
+                if (pcoin->vout[nOut].scriptPubKey.GetBitcoinAddressHash160() == h160)
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+
+static string FundSignerAddress(const uint160& h160, uint256& fundTxid)
+{
+    CScript scriptFund;
+    scriptFund.SetBitcoinAddress(h160);
+
+    CWalletTx wtxFund;
+    CKey keyFund;
+    int64 nFeeFund = 0;
+    if (!CreateTransaction(scriptFund, DUST_THRESHOLD, wtxFund, keyFund, nFeeFund))
+        return strprintf("Failed to create funding tx. Need %s Bitok, wallet has %s",
+            FormatMoney(DUST_THRESHOLD + nFeeFund).c_str(), FormatMoney(GetBalance()).c_str());
+
+    if (!CommitTransaction(wtxFund, keyFund))
+        return "Failed to broadcast funding transaction";
+
+    fundTxid = wtxFund.GetHash();
+    return "";
+}
+
 Value sendatom(const Array& params, bool fHelp)
 {
     if (fHelp || params.size() != 2)
@@ -4646,16 +4695,29 @@ Value sendatom(const Array& params, bool fHelp)
 
         CScript scriptOpReturn = BuildAtomScript(transfer);
 
+        if (!HasSignerUtxo(src.h160))
+        {
+            uint256 fundTxid;
+            string strFundErr = FundSignerAddress(src.h160, fundTxid);
+            if (!strFundErr.empty())
+                throw runtime_error(strFundErr);
+            txids.push_back(fundTxid.ToString());
+        }
+
         CWalletTx wtx;
         CKey changeKey;
         int64 nFeeRequired = 0;
+        string strReason;
 
-        if (!CreateStealthTransaction(scriptDest, scriptOpReturn, DUST_THRESHOLD, wtx, changeKey, nFeeRequired))
+        if (!CreateStealthTransaction(scriptDest, scriptOpReturn, DUST_THRESHOLD, wtx, changeKey, nFeeRequired, src.h160, &strReason))
         {
             string strError;
             if (DUST_THRESHOLD + nFeeRequired > GetBalance())
-                strError = strprintf("Insufficient Bitok balance to pay fee. Need %s",
-                                     FormatMoney(DUST_THRESHOLD + nFeeRequired).c_str());
+                strError = strprintf("Insufficient Bitok balance to pay fee. Need %s, have %s",
+                                     FormatMoney(DUST_THRESHOLD + nFeeRequired).c_str(),
+                                     FormatMoney(GetBalance()).c_str());
+            else if (!strReason.empty())
+                strError = strReason;
             else
                 strError = "Transaction creation failed";
             throw runtime_error(strError);
@@ -5107,11 +5169,19 @@ Value bridgeatomtosol(const Array& params, bool fHelp)
     if (!scriptSender.SetBitcoinAddress(strAddrBest))
         throw runtime_error("Failed to build sender script for: " + strAddrBest);
 
+    if (!HasSignerUtxo(h160Best))
+    {
+        uint256 fundTxid;
+        string strFundErr = FundSignerAddress(h160Best, fundTxid);
+        if (!strFundErr.empty())
+            throw runtime_error(strFundErr);
+    }
+
     CWalletTx wtx;
     CKey changeKey;
     int64 nFeeRequired = 0;
 
-    if (!CreateStealthTransaction(scriptSender, scriptOpReturn, DUST_THRESHOLD, wtx, changeKey, nFeeRequired))
+    if (!CreateStealthTransaction(scriptSender, scriptOpReturn, DUST_THRESHOLD, wtx, changeKey, nFeeRequired, h160Best))
     {
         string strError;
         if (DUST_THRESHOLD + nFeeRequired > GetBalance())
@@ -5132,6 +5202,105 @@ Value bridgeatomtosol(const Array& params, bool fHelp)
     result.push_back(Pair("amount",            dAmount));
     result.push_back(Pair("amount_raw",        (int64_t)nAmount));
     result.push_back(Pair("status",            string("pending")));
+    return result;
+}
+
+
+Value bridgemintbitok(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 2)
+        throw runtime_error(
+            "bridgemintbitok <toaddress> <amount>\n"
+            "Mint ATOM on Bitok via BRIDGE_TO_BITOK (type 0x05).\n"
+            "Only works if the bridge address private key is imported into the wallet.\n"
+            "<toaddress>  recipient Bitok address\n"
+            "<amount>     ATOM amount in ATOM units (e.g. 10.5 = 10.5 ATOM)");
+
+    string strTo   = params[0].get_str();
+    double dAmount = params[1].get_real();
+
+    uint160 hash160To;
+    if (!AddressToHash160(strTo, hash160To))
+        throw runtime_error("Invalid to address");
+
+    if (dAmount <= 0.0)
+        throw runtime_error("Amount must be positive");
+    if (dAmount > (double)ATOM_MAX_SUPPLY / (double)ATOM_DECIMALS)
+        throw runtime_error("Amount exceeds ATOM max supply");
+
+    int64 nAmount = roundint64(dAmount * (double)ATOM_DECIMALS);
+    if (nAmount <= 0)
+        throw runtime_error("Amount too small");
+
+    uint160 bridgeAddr(std::vector<unsigned char>(ATOM_BRIDGE_HASH, ATOM_BRIDGE_HASH + 20));
+
+    bool fHaveKey = false;
+    string strBridgeAddr;
+    CRITICAL_BLOCK(cs_mapKeys)
+    {
+        for (map<vector<unsigned char>, CPrivKey>::iterator it = mapKeys.begin();
+             it != mapKeys.end(); ++it)
+        {
+            const vector<unsigned char>& vchPubKey = it->first;
+            if (Hash160(vchPubKey) == bridgeAddr)
+            {
+                fHaveKey = true;
+                strBridgeAddr = PubKeyToAddress(vchPubKey);
+                break;
+            }
+        }
+    }
+
+    if (!fHaveKey)
+        throw runtime_error("Bridge address private key not found in wallet. Import it with importprivkey first.");
+
+    CAtomTransfer transfer;
+    transfer.nVersion = ATOM_VERSION;
+    transfer.nType    = ATOM_TYPE_BRIDGE_TO_BITOK;
+    transfer.addrFrom = bridgeAddr;
+    transfer.addrTo   = hash160To;
+    transfer.nAmount  = nAmount;
+    transfer.nNonce   = 0;
+
+    CScript scriptOpReturn = BuildAtomScript(transfer);
+
+    CScript scriptDest;
+    if (!scriptDest.SetBitcoinAddress(strTo))
+        throw runtime_error("Failed to build destination script for: " + strTo);
+
+    if (!HasSignerUtxo(bridgeAddr))
+    {
+        uint256 fundTxid;
+        string strFundErr = FundSignerAddress(bridgeAddr, fundTxid);
+        if (!strFundErr.empty())
+            throw runtime_error(strFundErr);
+    }
+
+    CWalletTx wtx;
+    CKey changeKey;
+    int64 nFeeRequired = 0;
+
+    if (!CreateStealthTransaction(scriptDest, scriptOpReturn, DUST_THRESHOLD, wtx, changeKey, nFeeRequired, bridgeAddr))
+    {
+        string strError;
+        if (DUST_THRESHOLD + nFeeRequired > GetBalance())
+            strError = strprintf("Insufficient Bitok balance to pay fee. Need %s",
+                                 FormatMoney(DUST_THRESHOLD + nFeeRequired).c_str());
+        else
+            strError = "Transaction creation failed";
+        throw runtime_error(strError);
+    }
+
+    if (!CommitTransaction(wtx, changeKey))
+        throw runtime_error("Transaction broadcast failed");
+
+    Object result;
+    result.push_back(Pair("txid",       wtx.GetHash().ToString()));
+    result.push_back(Pair("from",       strBridgeAddr));
+    result.push_back(Pair("to",         strTo));
+    result.push_back(Pair("amount",     dAmount));
+    result.push_back(Pair("amount_raw", (int64_t)nAmount));
+    result.push_back(Pair("status",     string("pending")));
     return result;
 }
 
@@ -5274,11 +5443,19 @@ Value dexsell(const Array& params, bool fHelp)
     if (!scriptDest.SetBitcoinAddress(strAddrBest))
         throw runtime_error("Failed to build destination script");
 
+    if (!HasSignerUtxo(h160Best))
+    {
+        uint256 fundTxid;
+        string strFundErr = FundSignerAddress(h160Best, fundTxid);
+        if (!strFundErr.empty())
+            throw runtime_error(strFundErr);
+    }
+
     CWalletTx wtx;
     CKey changeKey;
     int64 nFeeRequired = 0;
 
-    if (!CreateStealthTransaction(scriptDest, scriptOpReturn, DUST_THRESHOLD, wtx, changeKey, nFeeRequired))
+    if (!CreateStealthTransaction(scriptDest, scriptOpReturn, DUST_THRESHOLD, wtx, changeKey, nFeeRequired, h160Best))
     {
         if (DUST_THRESHOLD + nFeeRequired > GetBalance())
             throw runtime_error(strprintf("Insufficient Bitok balance to pay fee. Need %s",
@@ -5355,11 +5532,19 @@ Value dexcancel(const Array& params, bool fHelp)
     if (!scriptDest.SetBitcoinAddress(strAddr))
         throw runtime_error("Failed to build destination script");
 
+    if (!HasSignerUtxo(order.addrMaker))
+    {
+        uint256 fundTxid;
+        string strFundErr = FundSignerAddress(order.addrMaker, fundTxid);
+        if (!strFundErr.empty())
+            throw runtime_error(strFundErr);
+    }
+
     CWalletTx wtx;
     CKey changeKey;
     int64 nFeeRequired = 0;
 
-    if (!CreateStealthTransaction(scriptDest, scriptOpReturn, DUST_THRESHOLD, wtx, changeKey, nFeeRequired))
+    if (!CreateStealthTransaction(scriptDest, scriptOpReturn, DUST_THRESHOLD, wtx, changeKey, nFeeRequired, order.addrMaker))
     {
         if (DUST_THRESHOLD + nFeeRequired > GetBalance())
             throw runtime_error(strprintf("Insufficient Bitok balance to pay fee. Need %s",
@@ -5481,11 +5666,19 @@ Value dexbuy(const Array& params, bool fHelp)
     if (!scriptDest.SetBitcoinAddress(strMakerAddr))
         throw runtime_error("Failed to build maker destination script");
 
+    if (!HasSignerUtxo(h160Taker))
+    {
+        uint256 fundTxid;
+        string strFundErr = FundSignerAddress(h160Taker, fundTxid);
+        if (!strFundErr.empty())
+            throw runtime_error(strFundErr);
+    }
+
     CWalletTx wtx;
     CKey changeKey;
     int64 nFeeRequired = 0;
 
-    if (!CreateStealthTransaction(scriptDest, scriptOpReturn, nBitokPayment, wtx, changeKey, nFeeRequired))
+    if (!CreateStealthTransaction(scriptDest, scriptOpReturn, nBitokPayment, wtx, changeKey, nFeeRequired, h160Taker))
     {
         if (nBitokPayment + nFeeRequired > GetBalance())
             throw runtime_error(strprintf("Insufficient BITOK. Need %s",
@@ -5568,11 +5761,19 @@ Value dextake(const Array& params, bool fHelp)
     if (!scriptDest.SetBitcoinAddress(strMakerAddr))
         throw runtime_error("Failed to build maker destination script");
 
+    if (!HasSignerUtxo(h160Taker))
+    {
+        uint256 fundTxid;
+        string strFundErr = FundSignerAddress(h160Taker, fundTxid);
+        if (!strFundErr.empty())
+            throw runtime_error(strFundErr);
+    }
+
     CWalletTx wtx;
     CKey changeKey;
     int64 nFeeRequired = 0;
 
-    if (!CreateStealthTransaction(scriptDest, scriptOpReturn, nBitokPayment, wtx, changeKey, nFeeRequired))
+    if (!CreateStealthTransaction(scriptDest, scriptOpReturn, nBitokPayment, wtx, changeKey, nFeeRequired, h160Taker))
     {
         if (nBitokPayment + nFeeRequired > GetBalance())
             throw runtime_error(strprintf("Insufficient BITOK. Need %s",
@@ -5813,6 +6014,7 @@ pair<string, rpcfn_type> pCallTable[] =
     make_pair("createatomrawtx",         &createatomrawtx),
     make_pair("sendatom",                &sendatom),
     make_pair("bridgeatomtosol",         &bridgeatomtosol),
+    make_pair("bridgemintbitok",         &bridgemintbitok),
 
     make_pair("dexsell",                 &dexsell),
     make_pair("dexbuy",                  &dexbuy),

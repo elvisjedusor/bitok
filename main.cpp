@@ -5305,6 +5305,32 @@ int64 GetNetworkHashPS(int lookup)
 //
 
 
+bool IsOutputSpent(const uint256& hash, int nOut)
+{
+    COutPoint outpoint(hash, nOut);
+    CRITICAL_BLOCK(cs_mapTransactions)
+    {
+        if (mapNextTx.count(outpoint))
+            return true;
+    }
+    return false;
+}
+
+static int64 GetUnspentCredit(const CWalletTx& wtx)
+{
+    if (wtx.IsCoinBase() && wtx.GetBlocksToMaturity() > 0)
+        return 0;
+
+    int64 nCredit = 0;
+    uint256 hash = wtx.GetHash();
+    for (int i = 0; i < wtx.vout.size(); i++)
+    {
+        if (wtx.vout[i].IsMine() && !IsOutputSpent(hash, i))
+            nCredit += wtx.vout[i].nValue;
+    }
+    return nCredit;
+}
+
 int64 GetBalance()
 {
     int64 nStart = GetTimeMillis();
@@ -5317,7 +5343,15 @@ int64 GetBalance()
             CWalletTx* pcoin = &(*it).second;
             if (!pcoin->IsFinal() || pcoin->fSpent)
                 continue;
-            nTotal += pcoin->GetCredit(true);
+            if (!pcoin->IsInMainChain())
+            {
+                bool fInMempool = false;
+                CRITICAL_BLOCK(cs_mapTransactions)
+                    fInMempool = mapTransactions.count(pcoin->GetHash()) != 0;
+                if (!fInMempool)
+                    continue;
+            }
+            nTotal += GetUnspentCredit(*pcoin);
         }
     }
 
@@ -5331,7 +5365,6 @@ bool SelectCoins(int64 nTargetValue, set<CWalletTx*>& setCoinsRet)
 {
     setCoinsRet.clear();
 
-    // List of values less than target
     int64 nLowestLarger = INT64_MAX;
     CWalletTx* pcoinLowestLarger = NULL;
     vector<pair<int64, CWalletTx*> > vValue;
@@ -5344,7 +5377,15 @@ bool SelectCoins(int64 nTargetValue, set<CWalletTx*>& setCoinsRet)
             CWalletTx* pcoin = &(*it).second;
             if (!pcoin->IsFinal() || pcoin->fSpent)
                 continue;
-            int64 n = pcoin->GetCredit();
+            if (!pcoin->IsInMainChain())
+            {
+                bool fInMempool = false;
+                CRITICAL_BLOCK(cs_mapTransactions)
+                    fInMempool = mapTransactions.count(pcoin->GetHash()) != 0;
+                if (!fInMempool)
+                    continue;
+            }
+            int64 n = GetUnspentCredit(*pcoin);
             if (n <= 0)
                 continue;
             if (n < nTargetValue)
@@ -5373,7 +5414,6 @@ bool SelectCoins(int64 nTargetValue, set<CWalletTx*>& setCoinsRet)
         return true;
     }
 
-    // Solve subset sum by stochastic approximation
     sort(vValue.rbegin(), vValue.rend());
     vector<char> vfIncluded;
     vector<char> vfBest(vValue.size(), true);
@@ -5408,7 +5448,6 @@ bool SelectCoins(int64 nTargetValue, set<CWalletTx*>& setCoinsRet)
         }
     }
 
-    // If the next larger is still closer, return it
     if (pcoinLowestLarger && nLowestLarger - nTargetValue <= nBest - nTargetValue)
         setCoinsRet.insert(pcoinLowestLarger);
     else
@@ -5522,7 +5561,7 @@ bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, CK
                     return false;
                 int64 nValueIn = 0;
                 foreach(CWalletTx* pcoin, setCoins)
-                    nValueIn += pcoin->GetCredit();
+                    nValueIn += GetUnspentCredit(*pcoin);
 
                 // Fill a vout to the payee
                 bool fChangeFirst = GetRand(2);
@@ -5553,26 +5592,20 @@ bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, CK
                 // Fill vin
                 foreach(CWalletTx* pcoin, setCoins)
                     for (int nOut = 0; nOut < pcoin->vout.size(); nOut++)
-                        if (pcoin->vout[nOut].IsMine())
+                        if (pcoin->vout[nOut].IsMine() && !IsOutputSpent(pcoin->GetHash(), nOut))
                             wtxNew.vin.push_back(CTxIn(pcoin->GetHash(), nOut));
 
                 // Sign
                 int nIn = 0;
                 foreach(CWalletTx* pcoin, setCoins)
                     for (int nOut = 0; nOut < pcoin->vout.size(); nOut++)
-                        if (pcoin->vout[nOut].IsMine())
+                        if (pcoin->vout[nOut].IsMine() && !IsOutputSpent(pcoin->GetHash(), nOut))
                             SignSignature(*pcoin, wtxNew, nIn++);
 
-                // Check that enough fee is included
-                bool fAllowFree = false;
-                if (nBestHeight + 1 >= SCRIPT_EXEC_ACTIVATION_HEIGHT)
+                int64 nMinFee = wtxNew.GetMinFee(1, false);
+                if (nFee < nMinFee)
                 {
-                    double dPriority = ComputePriority(wtxNew, txdb, nBestHeight + 1);
-                    fAllowFree = (dPriority >= FREE_PRIORITY_THRESHOLD);
-                }
-                if (nFee < wtxNew.GetMinFee(1, fAllowFree))
-                {
-                    nFee = nFeeRequiredRet = wtxNew.GetMinFee(1, fAllowFree);
+                    nFee = nFeeRequiredRet = nMinFee;
                     continue;
                 }
 
@@ -5613,7 +5646,7 @@ bool CreateStealthTransaction(CScript scriptPubKey, const CScript& scriptOpRetur
                     return false;
                 int64 nValueIn = 0;
                 foreach(CWalletTx* pcoin, setCoins)
-                    nValueIn += pcoin->GetCredit();
+                    nValueIn += GetUnspentCredit(*pcoin);
 
                 bool fChangeFirst = GetRand(2);
                 if (!fChangeFirst)
@@ -5643,24 +5676,184 @@ bool CreateStealthTransaction(CScript scriptPubKey, const CScript& scriptOpRetur
 
                 foreach(CWalletTx* pcoin, setCoins)
                     for (int nOut = 0; nOut < pcoin->vout.size(); nOut++)
-                        if (pcoin->vout[nOut].IsMine())
+                        if (pcoin->vout[nOut].IsMine() && !IsOutputSpent(pcoin->GetHash(), nOut))
                             wtxNew.vin.push_back(CTxIn(pcoin->GetHash(), nOut));
 
                 int nIn = 0;
                 foreach(CWalletTx* pcoin, setCoins)
                     for (int nOut = 0; nOut < pcoin->vout.size(); nOut++)
-                        if (pcoin->vout[nOut].IsMine())
+                        if (pcoin->vout[nOut].IsMine() && !IsOutputSpent(pcoin->GetHash(), nOut))
                             SignSignature(*pcoin, wtxNew, nIn++);
 
-                bool fAllowFree = false;
-                if (nBestHeight + 1 >= SCRIPT_EXEC_ACTIVATION_HEIGHT)
+                int64 nMinFee = wtxNew.GetMinFee(1, false);
+                if (nFee < nMinFee)
                 {
-                    double dPriority = ComputePriority(wtxNew, txdb, nBestHeight + 1);
-                    fAllowFree = (dPriority >= FREE_PRIORITY_THRESHOLD);
+                    nFee = nFeeRequiredRet = nMinFee;
+                    continue;
                 }
-                if (nFee < wtxNew.GetMinFee(1, fAllowFree))
+
+                wtxNew.AddSupportingTransactions(txdb);
+                wtxNew.fTimeReceivedIsTxTime = true;
+
+                break;
+            }
+        }
+    }
+    return true;
+}
+
+
+static bool FindSignerUtxo(const uint160& requiredSigner,
+                           CWalletTx*& pSignerCoin, int& nSignerOut)
+{
+    pSignerCoin = NULL;
+    nSignerOut = -1;
+    for (map<uint256, CWalletTx>::iterator it = mapWallet.begin(); it != mapWallet.end(); ++it)
+    {
+        CWalletTx* pcoin = &(*it).second;
+        if (!pcoin->IsFinal() || pcoin->fSpent)
+            continue;
+        if (!pcoin->IsInMainChain())
+        {
+            bool fInMempool = false;
+            CRITICAL_BLOCK(cs_mapTransactions)
+                fInMempool = mapTransactions.count(pcoin->GetHash()) != 0;
+            if (!fInMempool)
+                continue;
+        }
+        uint256 hash = pcoin->GetHash();
+        for (int nOut = 0; nOut < pcoin->vout.size(); nOut++)
+        {
+            if (!pcoin->vout[nOut].IsMine() || IsOutputSpent(hash, nOut))
+                continue;
+            uint160 h160 = pcoin->vout[nOut].scriptPubKey.GetBitcoinAddressHash160();
+            if (h160 == requiredSigner)
+            {
+                pSignerCoin = pcoin;
+                nSignerOut = nOut;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+
+bool CreateStealthTransaction(CScript scriptPubKey, const CScript& scriptOpReturn,
+                              int64 nValue, CWalletTx& wtxNew, CKey& keyRet,
+                              int64& nFeeRequiredRet, const uint160& requiredSigner,
+                              string* pstrReason)
+{
+    nFeeRequiredRet = 0;
+    CRITICAL_BLOCK(cs_main)
+    {
+        CTxDB txdb("r");
+        CRITICAL_BLOCK(cs_mapWallet)
+        {
+            int64 nFee = nTransactionFee;
+            loop
+            {
+                wtxNew.vin.clear();
+                wtxNew.vout.clear();
+                wtxNew.fFromMe = true;
+                if (nValue < 0)
                 {
-                    nFee = nFeeRequiredRet = wtxNew.GetMinFee(1, fAllowFree);
+                    if (pstrReason) *pstrReason = "Negative value";
+                    return false;
+                }
+                int64 nValueOut = nValue;
+                int64 nTotalValue = nValue + nFee;
+
+                set<CWalletTx*> setCoins;
+                if (!SelectCoins(nTotalValue, setCoins))
+                {
+                    if (pstrReason) *pstrReason = strprintf("SelectCoins failed: need %s Bitok (dust + fee), wallet balance %s",
+                        FormatMoney(nTotalValue).c_str(), FormatMoney(GetBalance()).c_str());
+                    return false;
+                }
+
+                bool fSignerInSet = false;
+                CWalletTx* pSignerCoin = NULL;
+                int nSignerOut = -1;
+
+                foreach(CWalletTx* pcoin, setCoins)
+                {
+                    uint256 hash = pcoin->GetHash();
+                    for (int nOut = 0; nOut < pcoin->vout.size(); nOut++)
+                    {
+                        if (!pcoin->vout[nOut].IsMine() || IsOutputSpent(hash, nOut))
+                            continue;
+                        uint160 h160 = pcoin->vout[nOut].scriptPubKey.GetBitcoinAddressHash160();
+                        if (h160 == requiredSigner)
+                        {
+                            fSignerInSet = true;
+                            break;
+                        }
+                    }
+                    if (fSignerInSet)
+                        break;
+                }
+
+                if (!fSignerInSet)
+                {
+                    if (!FindSignerUtxo(requiredSigner, pSignerCoin, nSignerOut))
+                    {
+                        if (pstrReason) *pstrReason = "No Bitok UTXO found for the ATOM source address. Send a small amount of Bitok to this address first";
+                        return false;
+                    }
+                    setCoins.insert(pSignerCoin);
+                }
+
+                int64 nValueIn = 0;
+                foreach(CWalletTx* pcoin, setCoins)
+                {
+                    uint256 hash = pcoin->GetHash();
+                    for (int nOut = 0; nOut < pcoin->vout.size(); nOut++)
+                        if (pcoin->vout[nOut].IsMine() && !IsOutputSpent(hash, nOut))
+                            nValueIn += pcoin->vout[nOut].nValue;
+                }
+
+                bool fChangeFirst = GetRand(2);
+                if (!fChangeFirst)
+                {
+                    wtxNew.vout.push_back(CTxOut(nValueOut, scriptPubKey));
+                    wtxNew.vout.push_back(CTxOut(0, scriptOpReturn));
+                }
+
+                if (nValueIn > nTotalValue)
+                {
+                    if (keyRet.IsNull())
+                    {
+                        if (!GetStealthChangeKeyForInputs(setCoins, keyRet))
+                            keyRet.MakeNewKey();
+                    }
+
+                    CScript scriptChange;
+                    scriptChange.SetBitcoinAddress(keyRet.GetPubKey());
+                    wtxNew.vout.push_back(CTxOut(nValueIn - nTotalValue, scriptChange));
+                }
+
+                if (fChangeFirst)
+                {
+                    wtxNew.vout.push_back(CTxOut(nValueOut, scriptPubKey));
+                    wtxNew.vout.push_back(CTxOut(0, scriptOpReturn));
+                }
+
+                foreach(CWalletTx* pcoin, setCoins)
+                    for (int nOut = 0; nOut < pcoin->vout.size(); nOut++)
+                        if (pcoin->vout[nOut].IsMine() && !IsOutputSpent(pcoin->GetHash(), nOut))
+                            wtxNew.vin.push_back(CTxIn(pcoin->GetHash(), nOut));
+
+                int nIn = 0;
+                foreach(CWalletTx* pcoin, setCoins)
+                    for (int nOut = 0; nOut < pcoin->vout.size(); nOut++)
+                        if (pcoin->vout[nOut].IsMine() && !IsOutputSpent(pcoin->GetHash(), nOut))
+                            SignSignature(*pcoin, wtxNew, nIn++);
+
+                int64 nMinFee = wtxNew.GetMinFee(1, false);
+                if (nFee < nMinFee)
+                {
+                    nFee = nFeeRequiredRet = nMinFee;
                     continue;
                 }
 
