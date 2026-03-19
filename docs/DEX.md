@@ -1,6 +1,6 @@
 # BITOK/ATOM DEX — Technical Reference
 
-Built-in peer-to-peer exchange between BITOK (native coin) and ATOM (trust scoring system token built on BITOK blockchain). Settlement is fully atomic and enforced at the consensus layer. No trusted intermediary, no off-chain components.
+Built-in peer-to-peer exchange between BITOK (native coin) and ATOM (token representing a reputation metric derived from on-chain activity and optional bonding). Settlement is fully atomic and enforced at the consensus layer. No trusted intermediary, no off-chain components.
 
 ---
 

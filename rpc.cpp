@@ -6346,6 +6346,18 @@ int CommandLineRPC(int argc, char *argv[])
             if (strMethod == "verifyscriptpair"         && n > 1) ConvertTo<boost::int64_t>(params[1]);
             if (strMethod == "importprivkey"            && n > 2) ConvertTo<bool>(params[2]);
 
+            if (strMethod == "sendatom"                 && n > 1) ConvertTo<double>(params[1]);
+            if (strMethod == "createatomrawtx"          && n > 2) ConvertTo<double>(params[2]);
+            if (strMethod == "createatomrawtx"          && n > 3) ConvertTo<boost::int64_t>(params[3]);
+            if (strMethod == "createatomrawtx"          && n > 4) ConvertTo<Array>(params[4]);
+            if (strMethod == "bridgeatomtosol"          && n > 1) ConvertTo<double>(params[1]);
+            if (strMethod == "getatomhistory"           && n > 1) ConvertTo<boost::int64_t>(params[1]);
+            if (strMethod == "listatomtransactions"     && n > 0) ConvertTo<boost::int64_t>(params[0]);
+            if (strMethod == "dexsell"                  && n > 0) ConvertTo<double>(params[0]);
+            if (strMethod == "dexsell"                  && n > 1) ConvertTo<double>(params[1]);
+            if (strMethod == "dexbuy"                   && n > 0) ConvertTo<double>(params[0]);
+            if (strMethod == "dexbuy"                   && n > 1) ConvertTo<double>(params[1]);
+
             // Execute
             result = CallRPC(strMethod, params);
         }
