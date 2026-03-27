@@ -1098,7 +1098,7 @@ bool CTxDB::ReadAddrUTXOs(uint160 addr, vector<pair<COutPoint, pair<int64, pair<
 static bool EraseKeysByPrefix(Db* pdb, DbTxn* ptxn, const string& strPrefix)
 {
     Dbc* pcursor = NULL;
-    if (pdb->cursor(NULL, &pcursor, 0) != 0 || pcursor == NULL)
+    if (pdb->cursor(ptxn, &pcursor, 0) != 0 || pcursor == NULL)
         return false;
 
     vector<vector<unsigned char> > vKeysToErase;
@@ -1124,6 +1124,8 @@ static bool EraseKeysByPrefix(Db* pdb, DbTxn* ptxn, const string& strPrefix)
         const char* pKey = (const char*)datKey.get_data();
         size_t nKeySize = datKey.get_size();
 
+        vector<unsigned char> vKey((const unsigned char*)pKey, (const unsigned char*)pKey + nKeySize);
+
         bool fMatch = false;
         if (nKeySize >= ssSeek.size())
         {
@@ -1139,8 +1141,7 @@ static bool EraseKeysByPrefix(Db* pdb, DbTxn* ptxn, const string& strPrefix)
         if (!fMatch)
             break;
 
-        CDataStream ssKeyStore(pKey, pKey + nKeySize, SER_DISK);
-        vKeysToErase.push_back(vector<unsigned char>(ssKeyStore.begin(), ssKeyStore.end()));
+        vKeysToErase.push_back(vKey);
 
         datKey.set_flags(DB_DBT_MALLOC);
         datValue.set_flags(DB_DBT_MALLOC);
@@ -1168,6 +1169,328 @@ bool CTxDB::EraseAllIndexerData()
     Erase(string("indexerheight"));
     return true;
 }
+
+
+// ---------------------------------------------------------------------------
+// ATOM layer DB methods
+// ---------------------------------------------------------------------------
+
+struct CAtomBalanceEntry
+{
+    int64    nBalance;
+    uint32_t nNonce;
+
+    CAtomBalanceEntry() : nBalance(0), nNonce(0) {}
+
+    IMPLEMENT_SERIALIZE(
+        READWRITE(nBalance);
+        READWRITE(nNonce);
+    )
+};
+
+bool CTxDB::WriteAtomBalance(uint160 addr, int64 nBalance, uint32_t nNonce)
+{
+    CAtomBalanceEntry entry;
+    entry.nBalance = nBalance;
+    entry.nNonce   = nNonce;
+    return Write(make_pair(string("atombal"), addr), entry);
+}
+
+bool CTxDB::ReadAtomBalance(uint160 addr, int64& nBalance, uint32_t& nNonce)
+{
+    CAtomBalanceEntry entry;
+    if (!Read(make_pair(string("atombal"), addr), entry))
+    {
+        nBalance = 0;
+        nNonce   = 0;
+        return false;
+    }
+    nBalance = entry.nBalance;
+    nNonce   = entry.nNonce;
+    return true;
+}
+
+bool CTxDB::ReadAtomBalance(uint160 addr, int64& nBalance, uint32_t& nNonce, bool& fDbError)
+{
+    fDbError = false;
+    CAtomBalanceEntry entry;
+    if (!Read(make_pair(string("atombal"), addr), entry))
+    {
+        nBalance = 0;
+        nNonce   = 0;
+        if (Exists(make_pair(string("atombal"), addr)))
+            fDbError = true;
+        return false;
+    }
+    nBalance = entry.nBalance;
+    nNonce   = entry.nNonce;
+    return true;
+}
+
+bool CTxDB::EraseAtomBalance(uint160 addr)
+{
+    return Erase(make_pair(string("atombal"), addr));
+}
+
+bool CTxDB::SumAllAtomBalances(int64& nTotalOut)
+{
+    nTotalOut = 0;
+
+    Dbc* pcursor = GetCursor();
+    if (!pcursor)
+        return false;
+
+    CDataStream ssKey;
+    ssKey << string("atombal");
+    unsigned int fFlags = DB_SET_RANGE;
+
+    loop
+    {
+        CDataStream ssKeyRet;
+        if (fFlags == DB_SET_RANGE)
+            ssKeyRet = ssKey;
+        CDataStream ssValue;
+        int ret = ReadAtCursor(pcursor, ssKeyRet, ssValue, fFlags);
+        fFlags = DB_NEXT;
+        if (ret == DB_NOTFOUND)
+            break;
+        else if (ret != 0)
+        {
+            pcursor->close();
+            return false;
+        }
+
+        string strType;
+        try { ssKeyRet >> strType; } catch (...) { break; }
+        if (strType != "atombal")
+            break;
+
+        CAtomBalanceEntry entry;
+        try { ssValue >> entry; } catch (...) { break; }
+
+        if (entry.nBalance > 0)
+            nTotalOut += entry.nBalance;
+    }
+
+    pcursor->close();
+    return true;
+}
+
+struct CAtomTxEntry
+{
+    int           nHeight;
+    unsigned int  nTime;
+    unsigned char nType;
+    uint160       addrFrom;
+    uint160       addrTo;
+    int64         nAmount;
+    uint32_t      nNonce;
+    unsigned char solAddrTo[32];
+
+    CAtomTxEntry() : nHeight(0), nTime(0), nType(0), addrFrom(0), addrTo(0), nAmount(0), nNonce(0)
+    {
+        memset(solAddrTo, 0, 32);
+    }
+
+    IMPLEMENT_SERIALIZE(
+        READWRITE(nHeight);
+        READWRITE(nTime);
+        READWRITE(nType);
+        READWRITE(addrFrom);
+        READWRITE(addrTo);
+        READWRITE(nAmount);
+        READWRITE(nNonce);
+        READWRITE(FLATDATA(solAddrTo));
+    )
+};
+
+bool CTxDB::WriteAtomTx(uint256 txhash, int nHeight, unsigned int nTime, unsigned char nType,
+                        uint160 addrFrom, uint160 addrTo, int64 nAmount, uint32_t nNonce,
+                        const unsigned char* pSolAddrTo)
+{
+    CAtomTxEntry entry;
+    entry.nHeight  = nHeight;
+    entry.nTime    = nTime;
+    entry.nType    = nType;
+    entry.addrFrom = addrFrom;
+    entry.addrTo   = addrTo;
+    entry.nAmount  = nAmount;
+    entry.nNonce   = nNonce;
+    if (pSolAddrTo)
+        memcpy(entry.solAddrTo, pSolAddrTo, 32);
+    return Write(make_pair(string("atomtx"), txhash), entry);
+}
+
+bool CTxDB::ReadAtomTx(uint256 txhash, int& nHeight, unsigned int& nTime, unsigned char& nType,
+                       uint160& addrFrom, uint160& addrTo, int64& nAmount, uint32_t& nNonce,
+                       unsigned char* pSolAddrTo)
+{
+    CAtomTxEntry entry;
+    if (!Read(make_pair(string("atomtx"), txhash), entry))
+        return false;
+    nHeight  = entry.nHeight;
+    nTime    = entry.nTime;
+    nType    = entry.nType;
+    addrFrom = entry.addrFrom;
+    addrTo   = entry.addrTo;
+    nAmount  = entry.nAmount;
+    nNonce   = entry.nNonce;
+    if (pSolAddrTo)
+        memcpy(pSolAddrTo, entry.solAddrTo, 32);
+    return true;
+}
+
+bool CTxDB::EraseAtomTx(uint256 txhash)
+{
+    return Erase(make_pair(string("atomtx"), txhash));
+}
+
+bool CTxDB::WriteAtomAddrTx(uint160 addr, uint256 txhash, int nHeight)
+{
+    return Write(make_pair(make_pair(string("atomaddrtx"), addr), txhash), nHeight);
+}
+
+bool CTxDB::EraseAtomAddrTx(uint160 addr, uint256 txhash)
+{
+    return Erase(make_pair(make_pair(string("atomaddrtx"), addr), txhash));
+}
+
+bool CTxDB::ReadAtomAddrTxids(uint160 addr, vector<uint256>& vtxids)
+{
+    vtxids.clear();
+
+    Dbc* pcursor = GetCursor();
+    if (!pcursor)
+        return false;
+
+    unsigned int fFlags = DB_SET_RANGE;
+    loop
+    {
+        CDataStream ssKey(SER_DISK);
+        if (fFlags == DB_SET_RANGE)
+            ssKey << make_pair(make_pair(string("atomaddrtx"), addr), uint256(0));
+        CDataStream ssValue(SER_DISK);
+        int ret = ReadAtCursor(pcursor, ssKey, ssValue, fFlags);
+        fFlags = DB_NEXT;
+        if (ret == DB_NOTFOUND)
+            break;
+        else if (ret != 0)
+        {
+            pcursor->close();
+            return false;
+        }
+
+        string strType;
+        uint160 addrItem;
+        uint256 txhash;
+        try
+        {
+            ssKey >> strType >> addrItem >> txhash;
+        }
+        catch (...)
+        {
+            break;
+        }
+
+        if (strType != "atomaddrtx" || addrItem != addr)
+            break;
+
+        vtxids.push_back(txhash);
+    }
+
+    pcursor->close();
+    return true;
+}
+
+bool CTxDB::EraseAllAtomData()
+{
+    DbTxn* ptxn = GetTxn();
+    EraseKeysByPrefix(pdb, ptxn, string("atombal"));
+    EraseKeysByPrefix(pdb, ptxn, string("atomtx"));
+    EraseKeysByPrefix(pdb, ptxn, string("atomaddrtx"));
+    Erase(string("atomtotalminted"));
+    return true;
+}
+
+bool CTxDB::WriteAtomTotalMinted(int64 nTotal)
+{
+    return Write(string("atomtotalminted"), nTotal);
+}
+
+bool CTxDB::ReadAtomTotalMinted(int64& nTotal)
+{
+    if (!Read(string("atomtotalminted"), nTotal))
+    {
+        nTotal = 0;
+        return false;
+    }
+    return true;
+}
+
+
+// ---------------------------------------------------------------------------
+// DEX order DB methods
+// ---------------------------------------------------------------------------
+
+bool CTxDB::WriteDexOrder(uint256 txhash, const CDexOrderEntry& entry)
+{
+    return Write(make_pair(string("dexorder"), txhash), entry);
+}
+
+bool CTxDB::ReadDexOrder(uint256 txhash, CDexOrderEntry& entry)
+{
+    return Read(make_pair(string("dexorder"), txhash), entry);
+}
+
+bool CTxDB::EraseDexOrder(uint256 txhash)
+{
+    return Erase(make_pair(string("dexorder"), txhash));
+}
+
+bool CTxDB::LoadAllDexOrders(std::map<uint256, CDexOrderEntry>& orders)
+{
+    orders.clear();
+
+    Dbc* pcursor = GetCursor();
+    if (!pcursor)
+        return false;
+
+    CDataStream ssKey;
+    ssKey << string("dexorder");
+    unsigned int fFlags = DB_SET_RANGE;
+
+    loop
+    {
+        CDataStream ssKeyRet;
+        if (fFlags == DB_SET_RANGE)
+            ssKeyRet = ssKey;
+        CDataStream ssValue;
+        int ret = ReadAtCursor(pcursor, ssKeyRet, ssValue, fFlags);
+        fFlags = DB_NEXT;
+        if (ret == DB_NOTFOUND)
+            break;
+        else if (ret != 0)
+        {
+            pcursor->close();
+            return false;
+        }
+
+        string strType;
+        uint256 txhash;
+        try { ssKeyRet >> strType >> txhash; } catch (...) { break; }
+        if (strType != "dexorder")
+            break;
+
+        CDexOrderEntry entry;
+        try { ssValue >> entry; } catch (...) { continue; }
+
+        orders[txhash] = entry;
+    }
+
+    pcursor->close();
+    return true;
+}
+
 
 CBlockIndex* InsertBlockIndex(uint256 hash)
 {

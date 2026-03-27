@@ -5,6 +5,7 @@
 #include "headers.h"
 #include "sha.h"
 #include "crypto/sha256.h"
+#include "atom.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -888,6 +889,148 @@ bool CTransaction::AcceptTransaction(CTxDB& txdb, bool fCheckInputs, bool* pfMis
                          hash.ToString().substr(0,6).c_str(), nFees, nMinRelayFee);
     }
 
+    // ATOM layer: validate nonce and spendable balance before accepting to mempool.
+    CAtomTransfer atomTransfer;
+    bool fHasAtom = false;
+    if (nBestHeight + 1 >= ATOM_ACTIVATION_HEIGHT)
+        fHasAtom = GetAtomTransfer(*this, atomTransfer);
+
+    if (fHasAtom)
+    {
+        if (atomTransfer.nType == ATOM_TYPE_COINBASE)
+            return error("AcceptTransaction() : ATOM COINBASE type rejected in user tx %s",
+                         hash.ToString().substr(0, 6).c_str());
+
+        if (atomTransfer.nType == ATOM_TYPE_BRIDGE_TO_BITOK)
+        {
+            uint160 bridgeAddr(std::vector<unsigned char>(ATOM_BRIDGE_HASH, ATOM_BRIDGE_HASH + 20));
+            if (atomTransfer.addrFrom != bridgeAddr)
+                return error("AcceptTransaction() : ATOM BRIDGE_TO_BITOK rejected: addrFrom is not bridge address in tx %s",
+                             hash.ToString().substr(0, 6).c_str());
+        }
+
+        if (atomTransfer.nType == ATOM_TYPE_TRANSFER || atomTransfer.nType == ATOM_TYPE_BRIDGE_TO_SOL)
+        {
+            if (!VerifyAtomSender(*this, atomTransfer.addrFrom))
+                return error("AcceptTransaction() : ATOM sender verification failed: no input signed by addrFrom %s in tx %s",
+                             atomTransfer.addrFrom.ToString().c_str(),
+                             hash.ToString().substr(0, 6).c_str());
+
+            int64 nAtomBal = 0;
+            uint32_t nConfirmedNonce = 0;
+            if (fCheckInputs)
+            {
+                CTxDB txdbAtom("r");
+                bool fDbError = false;
+                if (!txdbAtom.ReadAtomBalance(atomTransfer.addrFrom, nAtomBal, nConfirmedNonce, fDbError) && fDbError)
+                    return error("AcceptTransaction() : DB error reading ATOM balance for %s",
+                                 atomTransfer.addrFrom.ToString().c_str());
+            }
+
+            if (!AtomMempoolCheckNonce(atomTransfer.addrFrom, atomTransfer.nNonce, nConfirmedNonce))
+                return error("AcceptTransaction() : ATOM nonce invalid or already used for %s",
+                             hash.ToString().substr(0, 6).c_str());
+
+            int64 nAvailable = AtomGetEffectiveBalance(atomTransfer.addrFrom, nAtomBal);
+            if (nAvailable < atomTransfer.nAmount)
+                return error("AcceptTransaction() : insufficient ATOM balance for %s (spendable %" PRI64d " need %" PRI64d ")",
+                             hash.ToString().substr(0, 6).c_str(), nAvailable, atomTransfer.nAmount);
+        }
+    }
+
+    // DEX layer: validate DEX offer/cancel/take before accepting to mempool.
+    unsigned char nDexType = 0;
+    CAtomDexOffer dexOffer;
+    CAtomDexCancel dexCancel;
+    CAtomDexTake dexTake;
+    bool fHasDex = false;
+    if (nBestHeight + 1 >= ATOM_DEX_ACTIVATION_HEIGHT && !fHasAtom)
+        fHasDex = GetDexPayload(*this, nDexType, dexOffer, dexCancel, dexTake);
+
+    if (fHasDex)
+    {
+        if (nDexType == ATOM_TYPE_DEX_OFFER)
+        {
+            if (!VerifyAtomSender(*this, dexOffer.addrFrom))
+                return error("AcceptTransaction() : DEX_OFFER sender verification failed in tx %s",
+                             hash.ToString().substr(0, 6).c_str());
+
+            if (dexOffer.nSide != ATOM_DEX_SIDE_SELL_ATOM)
+                return error("AcceptTransaction() : DEX_OFFER only sell-side offers are supported in tx %s",
+                             hash.ToString().substr(0, 6).c_str());
+
+            int64 nAtomBal = 0;
+            uint32_t nConfirmedNonce = 0;
+            if (fCheckInputs)
+            {
+                CTxDB txdbDex("r");
+                txdbDex.ReadAtomBalance(dexOffer.addrFrom, nAtomBal, nConfirmedNonce);
+            }
+            if (!AtomMempoolCheckNonce(dexOffer.addrFrom, dexOffer.nNonce, nConfirmedNonce))
+                return error("AcceptTransaction() : DEX_OFFER nonce invalid in tx %s",
+                             hash.ToString().substr(0, 6).c_str());
+            int64 nAvailable = AtomGetEffectiveBalance(dexOffer.addrFrom, nAtomBal);
+            if (nAvailable < dexOffer.nAtomAmount)
+                return error("AcceptTransaction() : DEX_OFFER insufficient ATOM for sell in tx %s",
+                             hash.ToString().substr(0, 6).c_str());
+        }
+        else if (nDexType == ATOM_TYPE_DEX_CANCEL)
+        {
+            if (!VerifyAtomSender(*this, dexCancel.addrFrom))
+                return error("AcceptTransaction() : DEX_CANCEL sender verification failed in tx %s",
+                             hash.ToString().substr(0, 6).c_str());
+
+            CRITICAL_BLOCK(cs_mapDexOrders)
+            {
+                if (setDexMempoolCancels.count(dexCancel.hashOffer))
+                    return error("AcceptTransaction() : DEX_CANCEL duplicate: offer %s already has pending cancel in tx %s",
+                                 dexCancel.hashOffer.ToString().substr(0, 10).c_str(),
+                                 hash.ToString().substr(0, 6).c_str());
+                if (setDexMempoolTakes.count(dexCancel.hashOffer))
+                    return error("AcceptTransaction() : DEX_CANCEL rejected: offer %s has pending take in tx %s",
+                                 dexCancel.hashOffer.ToString().substr(0, 10).c_str(),
+                                 hash.ToString().substr(0, 6).c_str());
+
+                std::map<uint256, CDexOrderEntry>::iterator it = mapDexOrders.find(dexCancel.hashOffer);
+                if (it == mapDexOrders.end())
+                    return error("AcceptTransaction() : DEX_CANCEL references unknown offer %s in tx %s",
+                                 dexCancel.hashOffer.ToString().substr(0, 10).c_str(),
+                                 hash.ToString().substr(0, 6).c_str());
+                if (it->second.addrMaker != dexCancel.addrFrom)
+                    return error("AcceptTransaction() : DEX_CANCEL addrFrom does not match offer maker in tx %s",
+                                 hash.ToString().substr(0, 6).c_str());
+            }
+        }
+        else if (nDexType == ATOM_TYPE_DEX_TAKE)
+        {
+            if (!VerifyAtomSender(*this, dexTake.addrFrom))
+                return error("AcceptTransaction() : DEX_TAKE sender verification failed in tx %s",
+                             hash.ToString().substr(0, 6).c_str());
+
+            CRITICAL_BLOCK(cs_mapDexOrders)
+            {
+                if (setDexMempoolTakes.count(dexTake.hashOffer))
+                    return error("AcceptTransaction() : DEX_TAKE duplicate: offer %s already has pending take in tx %s",
+                                 dexTake.hashOffer.ToString().substr(0, 10).c_str(),
+                                 hash.ToString().substr(0, 6).c_str());
+                if (setDexMempoolCancels.count(dexTake.hashOffer))
+                    return error("AcceptTransaction() : DEX_TAKE rejected: offer %s has pending cancel in tx %s",
+                                 dexTake.hashOffer.ToString().substr(0, 10).c_str(),
+                                 hash.ToString().substr(0, 6).c_str());
+
+                std::map<uint256, CDexOrderEntry>::iterator it = mapDexOrders.find(dexTake.hashOffer);
+                if (it == mapDexOrders.end())
+                    return error("AcceptTransaction() : DEX_TAKE references unknown offer %s in tx %s",
+                                 dexTake.hashOffer.ToString().substr(0, 10).c_str(),
+                                 hash.ToString().substr(0, 6).c_str());
+
+                if (it->second.addrMaker == dexTake.addrFrom)
+                    return error("AcceptTransaction() : DEX_TAKE taker cannot be the maker in tx %s",
+                                 hash.ToString().substr(0, 6).c_str());
+            }
+        }
+    }
+
     // Store transaction in memory
     CRITICAL_BLOCK(cs_mapTransactions)
     {
@@ -898,6 +1041,20 @@ bool CTransaction::AcceptTransaction(CTxDB& txdb, bool fCheckInputs, bool* pfMis
             mapTransactions.erase(ptxOld->GetHash());
         }
         AddToMemoryPool();
+    }
+
+    // If this is an ATOM transfer, register it in the mempool ATOM index
+    if (fHasAtom)
+        AtomMempoolAdd(hash, atomTransfer);
+
+    if (fHasDex)
+    {
+        if (nDexType == ATOM_TYPE_DEX_OFFER)
+            DexMempoolAddOffer(hash, dexOffer);
+        else if (nDexType == ATOM_TYPE_DEX_CANCEL)
+            DexMempoolAddCancel(hash, dexCancel.hashOffer);
+        else if (nDexType == ATOM_TYPE_DEX_TAKE)
+            DexMempoolAddTake(hash, dexTake.hashOffer);
     }
 
     ///// are we sure this is ok when loading transactions or restoring block txes
@@ -1473,8 +1630,220 @@ bool CBlock::DisconnectBlock(CTxDB& txdb, CBlockIndex* pindex)
             }
         }
 
+        // ATOM layer: reverse ATOM balance changes for this tx.
+        if (pindex->nHeight >= ATOM_ACTIVATION_HEIGHT)
+        {
+            CAtomTransfer atomTransfer;
+            bool fAtomFound = GetAtomTransfer(tx, atomTransfer);
+            if (fAtomFound)
+            {
+                if (atomTransfer.nType == ATOM_TYPE_TRANSFER)
+                {
+                    int64 nBalFrom = 0;
+                    uint32_t nNonceFrom = 0;
+                    txdb.ReadAtomBalance(atomTransfer.addrFrom, nBalFrom, nNonceFrom);
+                    nBalFrom += atomTransfer.nAmount;
+                    if (nNonceFrom == atomTransfer.nNonce && atomTransfer.nNonce > 0)
+                        nNonceFrom = atomTransfer.nNonce - 1;
+                    txdb.WriteAtomBalance(atomTransfer.addrFrom, nBalFrom, nNonceFrom);
+                    if (fUseIndexer && !fIndexerRebuilding)
+                        txdb.EraseAtomAddrTx(atomTransfer.addrFrom, txhash);
+
+                    int64 nBalTo = 0;
+                    uint32_t nNonceTo = 0;
+                    txdb.ReadAtomBalance(atomTransfer.addrTo, nBalTo, nNonceTo);
+                    nBalTo -= atomTransfer.nAmount;
+                    if (nBalTo < 0) nBalTo = 0;
+                    txdb.WriteAtomBalance(atomTransfer.addrTo, nBalTo, nNonceTo);
+                    if (fUseIndexer && !fIndexerRebuilding)
+                        txdb.EraseAtomAddrTx(atomTransfer.addrTo, txhash);
+                }
+                else if (atomTransfer.nType == ATOM_TYPE_BRIDGE_TO_SOL)
+                {
+                    int64 nBalFrom = 0;
+                    uint32_t nNonceFrom = 0;
+                    txdb.ReadAtomBalance(atomTransfer.addrFrom, nBalFrom, nNonceFrom);
+                    nBalFrom += atomTransfer.nAmount;
+                    if (nNonceFrom == atomTransfer.nNonce && atomTransfer.nNonce > 0)
+                        nNonceFrom = atomTransfer.nNonce - 1;
+                    txdb.WriteAtomBalance(atomTransfer.addrFrom, nBalFrom, nNonceFrom);
+                    if (fUseIndexer && !fIndexerRebuilding)
+                        txdb.EraseAtomAddrTx(atomTransfer.addrFrom, txhash);
+                }
+                else if (atomTransfer.nType == ATOM_TYPE_BRIDGE_TO_BITOK)
+                {
+                    int64 nBalTo = 0;
+                    uint32_t nNonceTo = 0;
+                    txdb.ReadAtomBalance(atomTransfer.addrTo, nBalTo, nNonceTo);
+                    nBalTo -= atomTransfer.nAmount;
+                    if (nBalTo < 0) nBalTo = 0;
+                    txdb.WriteAtomBalance(atomTransfer.addrTo, nBalTo, nNonceTo);
+                    if (fUseIndexer && !fIndexerRebuilding)
+                        txdb.EraseAtomAddrTx(atomTransfer.addrTo, txhash);
+
+                    int64 nTotalMinted = 0;
+                    txdb.ReadAtomTotalMinted(nTotalMinted);
+                    nTotalMinted -= atomTransfer.nAmount;
+                    if (nTotalMinted < 0) nTotalMinted = 0;
+                    txdb.WriteAtomTotalMinted(nTotalMinted);
+                }
+
+                txdb.EraseAtomTx(txhash);
+            }
+        }
+
+        if (pindex->nHeight >= ATOM_DEX_ACTIVATION_HEIGHT)
+        {
+            unsigned char nDexType = 0;
+            CAtomDexOffer dexOffer;
+            CAtomDexCancel dexCancel;
+            CAtomDexTake dexTake;
+
+            if (GetDexPayload(tx, nDexType, dexOffer, dexCancel, dexTake))
+            {
+                if (nDexType == ATOM_TYPE_DEX_OFFER)
+                {
+                    int64 nBal = 0;
+                    uint32_t nNon = 0;
+                    txdb.ReadAtomBalance(dexOffer.addrFrom, nBal, nNon);
+                    nBal += dexOffer.nAtomAmount;
+                    if (nNon == dexOffer.nNonce && dexOffer.nNonce > 0)
+                        nNon = dexOffer.nNonce - 1;
+                    txdb.WriteAtomBalance(dexOffer.addrFrom, nBal, nNon);
+                    txdb.EraseDexOrder(txhash);
+                    CRITICAL_BLOCK(cs_mapDexOrders)
+                    {
+                        mapDexOrders.erase(txhash);
+                    }
+                }
+                else if (nDexType == ATOM_TYPE_DEX_CANCEL)
+                {
+                    CTransaction txOffer;
+                    if (txdb.ReadDiskTx(dexCancel.hashOffer, txOffer))
+                    {
+                        unsigned char nOfferType = 0;
+                        CAtomDexOffer origOffer;
+                        CAtomDexCancel ign1;
+                        CAtomDexTake ign2;
+                        if (GetDexPayload(txOffer, nOfferType, origOffer, ign1, ign2) &&
+                            nOfferType == ATOM_TYPE_DEX_OFFER)
+                        {
+                            int64 nBal = 0;
+                            uint32_t nNon = 0;
+                            txdb.ReadAtomBalance(origOffer.addrFrom, nBal, nNon);
+                            nBal -= origOffer.nAtomAmount;
+                            if (nBal < 0) nBal = 0;
+                            txdb.WriteAtomBalance(origOffer.addrFrom, nBal, nNon);
+
+                            CDexOrderEntry entry;
+                            entry.hashTx      = dexCancel.hashOffer;
+                            entry.addrMaker   = origOffer.addrFrom;
+                            entry.nSide       = origOffer.nSide;
+                            entry.nAtomAmount = origOffer.nAtomAmount;
+                            entry.nPrice      = origOffer.nPrice;
+                            entry.nNonce      = origOffer.nNonce;
+                            entry.nHeight     = 0;
+                            CTxIndex txindex;
+                            if (txdb.ReadTxIndex(dexCancel.hashOffer, txindex))
+                            {
+                                CBlock blk;
+                                if (blk.ReadFromDisk(txindex.pos.nFile, txindex.pos.nBlockPos, false))
+                                {
+                                    std::map<uint256, CBlockIndex*>::iterator bi = mapBlockIndex.find(blk.GetHash());
+                                    if (bi != mapBlockIndex.end())
+                                        entry.nHeight = bi->second->nHeight;
+                                }
+                            }
+                            txdb.WriteDexOrder(dexCancel.hashOffer, entry);
+                            CRITICAL_BLOCK(cs_mapDexOrders)
+                            {
+                                mapDexOrders[dexCancel.hashOffer] = entry;
+                            }
+                        }
+                    }
+                }
+                else if (nDexType == ATOM_TYPE_DEX_TAKE)
+                {
+                    CTransaction txOffer;
+                    if (txdb.ReadDiskTx(dexTake.hashOffer, txOffer))
+                    {
+                        unsigned char nOfferType = 0;
+                        CAtomDexOffer origOffer;
+                        CAtomDexCancel ign1;
+                        CAtomDexTake ign2;
+                        if (GetDexPayload(txOffer, nOfferType, origOffer, ign1, ign2) &&
+                            nOfferType == ATOM_TYPE_DEX_OFFER)
+                        {
+                            int64 nBalTaker = 0;
+                            uint32_t nNonTaker = 0;
+                            txdb.ReadAtomBalance(dexTake.addrFrom, nBalTaker, nNonTaker);
+                            nBalTaker -= origOffer.nAtomAmount;
+                            if (nBalTaker < 0) nBalTaker = 0;
+                            txdb.WriteAtomBalance(dexTake.addrFrom, nBalTaker, nNonTaker);
+
+                            CDexOrderEntry entry;
+                            entry.hashTx      = dexTake.hashOffer;
+                            entry.addrMaker   = origOffer.addrFrom;
+                            entry.nSide       = origOffer.nSide;
+                            entry.nAtomAmount = origOffer.nAtomAmount;
+                            entry.nPrice      = origOffer.nPrice;
+                            entry.nNonce      = origOffer.nNonce;
+                            entry.nHeight     = 0;
+                            CTxIndex txindex;
+                            if (txdb.ReadTxIndex(dexTake.hashOffer, txindex))
+                            {
+                                CBlock blk;
+                                if (blk.ReadFromDisk(txindex.pos.nFile, txindex.pos.nBlockPos, false))
+                                {
+                                    std::map<uint256, CBlockIndex*>::iterator bi = mapBlockIndex.find(blk.GetHash());
+                                    if (bi != mapBlockIndex.end())
+                                        entry.nHeight = bi->second->nHeight;
+                                }
+                            }
+                            txdb.WriteDexOrder(dexTake.hashOffer, entry);
+                            CRITICAL_BLOCK(cs_mapDexOrders)
+                            {
+                                mapDexOrders[dexTake.hashOffer] = entry;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if (!vtx[i].DisconnectInputs(txdb))
             return false;
+    }
+
+    // ATOM coinbase reward reversal: undo the miner's ATOM credit for this block.
+    if (pindex->nHeight >= ATOM_ACTIVATION_HEIGHT)
+    {
+        uint160 addrMiner;
+        if (GetScriptAddr(vtx[0].vout[0].scriptPubKey, addrMiner))
+        {
+            uint256 coinbaseHash = vtx[0].GetHash();
+            int nIgnHeight = 0; unsigned int nIgnTime = 0; unsigned char nIgnType = 0;
+            uint160 ignFrom(0), ignTo(0); int64 nStoredReward = 0; uint32_t nIgnNonce = 0;
+            if (txdb.ReadAtomTx(coinbaseHash, nIgnHeight, nIgnTime, nIgnType, ignFrom, ignTo, nStoredReward, nIgnNonce) && nStoredReward > 0)
+            {
+                int64 nMinerBal = 0;
+                uint32_t nMinerNonce = 0;
+                txdb.ReadAtomBalance(addrMiner, nMinerBal, nMinerNonce);
+                nMinerBal -= nStoredReward;
+                if (nMinerBal < 0) nMinerBal = 0;
+                txdb.WriteAtomBalance(addrMiner, nMinerBal, nMinerNonce);
+
+                int64 nTotalMinted = 0;
+                txdb.ReadAtomTotalMinted(nTotalMinted);
+                nTotalMinted -= nStoredReward;
+                if (nTotalMinted < 0) nTotalMinted = 0;
+                txdb.WriteAtomTotalMinted(nTotalMinted);
+
+                txdb.EraseAtomTx(coinbaseHash);
+                if (fUseIndexer && !fIndexerRebuilding)
+                    txdb.EraseAtomAddrTx(addrMiner, coinbaseHash);
+            }
+        }
     }
 
     // Update block index on disk without changing it in memory.
@@ -1497,6 +1866,311 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex)
     //// issue here: it doesn't know the version
     unsigned int nTxPos = pindex->nBlockPos + ::GetSerializeSize(CBlock(), SER_DISK) - 1 + GetSizeOfCompactSize(vtx.size());
 
+    // Pass 1: validate ATOM balances and update DB state.
+    // ATOM processing is only active at and above ATOM_ACTIVATION_HEIGHT.
+    if (pindex->nHeight >= ATOM_ACTIVATION_HEIGHT)
+    {
+    int64 nTotalMinted = 0;
+    txdb.ReadAtomTotalMinted(nTotalMinted);
+
+    foreach(const CTransaction& tx, vtx)
+    {
+        uint256 txhash = tx.GetHash();
+        CAtomTransfer atomTransfer;
+        if (GetAtomTransfer(tx, atomTransfer))
+        {
+            if (atomTransfer.nType == ATOM_TYPE_COINBASE)
+                return error("ConnectBlock() : ATOM COINBASE type rejected in user tx %s",
+                             txhash.ToString().substr(0, 10).c_str());
+
+            if (atomTransfer.nType == ATOM_TYPE_BRIDGE_TO_BITOK)
+            {
+                uint160 bridgeAddr(std::vector<unsigned char>(ATOM_BRIDGE_HASH, ATOM_BRIDGE_HASH + 20));
+                if (atomTransfer.addrFrom != bridgeAddr)
+                    return error("ConnectBlock() : ATOM BRIDGE_TO_BITOK rejected: addrFrom is not bridge address in tx %s",
+                                 txhash.ToString().substr(0, 10).c_str());
+
+                if (nTotalMinted + atomTransfer.nAmount > ATOM_MAX_SUPPLY)
+                    return error("ConnectBlock() : ATOM supply cap exceeded by bridge_to_bitok tx %s",
+                                 txhash.ToString().substr(0, 10).c_str());
+            }
+
+            if (atomTransfer.nType == ATOM_TYPE_TRANSFER || atomTransfer.nType == ATOM_TYPE_BRIDGE_TO_SOL)
+            {
+                if (!VerifyAtomSender(tx, atomTransfer.addrFrom))
+                    return error("ConnectBlock() : ATOM sender verification failed: no input signed by addrFrom %s in tx %s",
+                                 atomTransfer.addrFrom.ToString().c_str(),
+                                 txhash.ToString().substr(0, 10).c_str());
+            }
+
+            if (atomTransfer.nType == ATOM_TYPE_TRANSFER)
+            {
+                int64 nBalFrom = 0;
+                uint32_t nNonceFrom = 0;
+                txdb.ReadAtomBalance(atomTransfer.addrFrom, nBalFrom, nNonceFrom);
+                if (atomTransfer.nNonce <= nNonceFrom)
+                    return error("ConnectBlock() : ATOM nonce too low in tx %s: sender %s nonce %u <= confirmed %u",
+                                 txhash.ToString().substr(0, 10).c_str(),
+                                 atomTransfer.addrFrom.ToString().c_str(),
+                                 atomTransfer.nNonce, nNonceFrom);
+                if (atomTransfer.nNonce > nNonceFrom + ATOM_MAX_NONCE_GAP)
+                    return error("ConnectBlock() : ATOM nonce gap too large in tx %s: sender %s nonce %u > confirmed %u + %u",
+                                 txhash.ToString().substr(0, 10).c_str(),
+                                 atomTransfer.addrFrom.ToString().c_str(),
+                                 atomTransfer.nNonce, nNonceFrom, ATOM_MAX_NONCE_GAP);
+                if (nBalFrom < atomTransfer.nAmount)
+                    return error("ConnectBlock() : ATOM overdraft in tx %s: sender %s has %" PRI64d " but transfer is %" PRI64d,
+                                 txhash.ToString().substr(0, 10).c_str(),
+                                 atomTransfer.addrFrom.ToString().c_str(),
+                                 nBalFrom, atomTransfer.nAmount);
+                nBalFrom -= atomTransfer.nAmount;
+                if (atomTransfer.nNonce > nNonceFrom)
+                    nNonceFrom = atomTransfer.nNonce;
+                if (!txdb.WriteAtomBalance(atomTransfer.addrFrom, nBalFrom, nNonceFrom))
+                    return error("ConnectBlock() : WriteAtomBalance failed for sender %s tx %s",
+                                 atomTransfer.addrFrom.ToString().c_str(),
+                                 txhash.ToString().substr(0, 10).c_str());
+                if (fUseIndexer && !fIndexerRebuilding)
+                    txdb.WriteAtomAddrTx(atomTransfer.addrFrom, txhash, pindex->nHeight);
+
+                int64 nBalTo = 0;
+                uint32_t nNonceTo = 0;
+                txdb.ReadAtomBalance(atomTransfer.addrTo, nBalTo, nNonceTo);
+                nBalTo += atomTransfer.nAmount;
+                if (!txdb.WriteAtomBalance(atomTransfer.addrTo, nBalTo, nNonceTo))
+                    return error("ConnectBlock() : WriteAtomBalance failed for recipient %s tx %s",
+                                 atomTransfer.addrTo.ToString().c_str(),
+                                 txhash.ToString().substr(0, 10).c_str());
+                if (fUseIndexer && !fIndexerRebuilding)
+                    txdb.WriteAtomAddrTx(atomTransfer.addrTo, txhash, pindex->nHeight);
+            }
+            else if (atomTransfer.nType == ATOM_TYPE_BRIDGE_TO_SOL)
+            {
+                int64 nBalFrom = 0;
+                uint32_t nNonceFrom = 0;
+                txdb.ReadAtomBalance(atomTransfer.addrFrom, nBalFrom, nNonceFrom);
+                if (atomTransfer.nNonce <= nNonceFrom)
+                    return error("ConnectBlock() : ATOM nonce too low in burn tx %s: sender %s nonce %u <= confirmed %u",
+                                 txhash.ToString().substr(0, 10).c_str(),
+                                 atomTransfer.addrFrom.ToString().c_str(),
+                                 atomTransfer.nNonce, nNonceFrom);
+                if (atomTransfer.nNonce > nNonceFrom + ATOM_MAX_NONCE_GAP)
+                    return error("ConnectBlock() : ATOM nonce gap too large in burn tx %s: sender %s nonce %u > confirmed %u + %u",
+                                 txhash.ToString().substr(0, 10).c_str(),
+                                 atomTransfer.addrFrom.ToString().c_str(),
+                                 atomTransfer.nNonce, nNonceFrom, ATOM_MAX_NONCE_GAP);
+                if (nBalFrom < atomTransfer.nAmount)
+                    return error("ConnectBlock() : ATOM burn overdraft in tx %s: sender %s has %" PRI64d " but burn is %" PRI64d,
+                                 txhash.ToString().substr(0, 10).c_str(),
+                                 atomTransfer.addrFrom.ToString().c_str(),
+                                 nBalFrom, atomTransfer.nAmount);
+                nBalFrom -= atomTransfer.nAmount;
+                if (atomTransfer.nNonce > nNonceFrom)
+                    nNonceFrom = atomTransfer.nNonce;
+                if (!txdb.WriteAtomBalance(atomTransfer.addrFrom, nBalFrom, nNonceFrom))
+                    return error("ConnectBlock() : WriteAtomBalance failed for burn sender %s tx %s",
+                                 atomTransfer.addrFrom.ToString().c_str(),
+                                 txhash.ToString().substr(0, 10).c_str());
+                if (fUseIndexer && !fIndexerRebuilding)
+                    txdb.WriteAtomAddrTx(atomTransfer.addrFrom, txhash, pindex->nHeight);
+            }
+            else if (atomTransfer.nType == ATOM_TYPE_BRIDGE_TO_BITOK)
+            {
+                int64 nBalTo = 0;
+                uint32_t nNonceTo = 0;
+                txdb.ReadAtomBalance(atomTransfer.addrTo, nBalTo, nNonceTo);
+                nBalTo += atomTransfer.nAmount;
+                if (!txdb.WriteAtomBalance(atomTransfer.addrTo, nBalTo, nNonceTo))
+                    return error("ConnectBlock() : WriteAtomBalance failed for bridge_to_bitok recipient %s tx %s",
+                                 atomTransfer.addrTo.ToString().c_str(),
+                                 txhash.ToString().substr(0, 10).c_str());
+                if (fUseIndexer && !fIndexerRebuilding)
+                    txdb.WriteAtomAddrTx(atomTransfer.addrTo, txhash, pindex->nHeight);
+
+                nTotalMinted += atomTransfer.nAmount;
+            }
+
+            if (!txdb.WriteAtomTx(txhash, pindex->nHeight, pindex->nTime, atomTransfer.nType,
+                                  atomTransfer.addrFrom, atomTransfer.addrTo,
+                                  atomTransfer.nAmount, atomTransfer.nNonce,
+                                  atomTransfer.nType == ATOM_TYPE_BRIDGE_TO_SOL ? atomTransfer.solAddrTo : NULL))
+                return error("ConnectBlock() : WriteAtomTx failed for tx %s",
+                             txhash.ToString().substr(0, 10).c_str());
+
+            AtomMempoolRemove(txhash);
+        }
+
+        // DEX processing: handle offer/cancel/take operations
+        if (pindex->nHeight >= ATOM_DEX_ACTIVATION_HEIGHT)
+        {
+            unsigned char nDexType = 0;
+            CAtomDexOffer dexOffer;
+            CAtomDexCancel dexCancel;
+            CAtomDexTake dexTake;
+
+            if (GetDexPayload(tx, nDexType, dexOffer, dexCancel, dexTake))
+            {
+                if (nDexType == ATOM_TYPE_DEX_OFFER)
+                {
+                    if (!VerifyAtomSender(tx, dexOffer.addrFrom))
+                        return error("ConnectBlock() : DEX_OFFER sender verification failed in tx %s",
+                                     txhash.ToString().substr(0, 10).c_str());
+
+                    if (dexOffer.nSide != ATOM_DEX_SIDE_SELL_ATOM)
+                        return error("ConnectBlock() : DEX_OFFER only sell-side supported in tx %s",
+                                     txhash.ToString().substr(0, 10).c_str());
+
+                    if (DexComputeBitokPayment(dexOffer.nAtomAmount, dexOffer.nPrice) <= 0)
+                        return error("ConnectBlock() : DEX_OFFER total BITOK payment is zero in tx %s",
+                                     txhash.ToString().substr(0, 10).c_str());
+
+                    {
+                        int64 nBalFrom = 0;
+                        uint32_t nNonceFrom = 0;
+                        txdb.ReadAtomBalance(dexOffer.addrFrom, nBalFrom, nNonceFrom);
+                        if (dexOffer.nNonce <= nNonceFrom)
+                            return error("ConnectBlock() : DEX_OFFER nonce too low in tx %s",
+                                         txhash.ToString().substr(0, 10).c_str());
+                        if (dexOffer.nNonce > nNonceFrom + ATOM_MAX_NONCE_GAP)
+                            return error("ConnectBlock() : DEX_OFFER nonce gap too large in tx %s",
+                                         txhash.ToString().substr(0, 10).c_str());
+                        if (nBalFrom < dexOffer.nAtomAmount)
+                            return error("ConnectBlock() : DEX_OFFER insufficient ATOM in tx %s",
+                                         txhash.ToString().substr(0, 10).c_str());
+
+                        nBalFrom -= dexOffer.nAtomAmount;
+                        nNonceFrom = dexOffer.nNonce;
+                        txdb.WriteAtomBalance(dexOffer.addrFrom, nBalFrom, nNonceFrom);
+                    }
+
+                    CDexOrderEntry entry;
+                    entry.hashTx      = txhash;
+                    entry.addrMaker   = dexOffer.addrFrom;
+                    entry.nSide       = dexOffer.nSide;
+                    entry.nAtomAmount = dexOffer.nAtomAmount;
+                    entry.nPrice      = dexOffer.nPrice;
+                    entry.nNonce      = dexOffer.nNonce;
+                    entry.nHeight     = pindex->nHeight;
+                    entry.nTime       = pindex->nTime;
+
+                    txdb.WriteDexOrder(txhash, entry);
+
+                    CRITICAL_BLOCK(cs_mapDexOrders)
+                    {
+                        mapDexOrders[txhash] = entry;
+                    }
+
+                    DexMempoolRemove(txhash);
+                }
+                else if (nDexType == ATOM_TYPE_DEX_CANCEL)
+                {
+                    if (!VerifyAtomSender(tx, dexCancel.addrFrom))
+                        return error("ConnectBlock() : DEX_CANCEL sender verification failed in tx %s",
+                                     txhash.ToString().substr(0, 10).c_str());
+
+                    CDexOrderEntry cancelledOrder;
+                    bool fFound = false;
+                    CRITICAL_BLOCK(cs_mapDexOrders)
+                    {
+                        std::map<uint256, CDexOrderEntry>::iterator it = mapDexOrders.find(dexCancel.hashOffer);
+                        if (it != mapDexOrders.end())
+                        {
+                            if (it->second.addrMaker != dexCancel.addrFrom)
+                                return error("ConnectBlock() : DEX_CANCEL maker mismatch in tx %s",
+                                             txhash.ToString().substr(0, 10).c_str());
+                            cancelledOrder = it->second;
+                            fFound = true;
+                        }
+                    }
+
+                    if (!fFound)
+                        return error("ConnectBlock() : DEX_CANCEL references non-existent offer in tx %s",
+                                     txhash.ToString().substr(0, 10).c_str());
+
+                    {
+                        int64 nBal = 0;
+                        uint32_t nNon = 0;
+                        txdb.ReadAtomBalance(cancelledOrder.addrMaker, nBal, nNon);
+                        nBal += cancelledOrder.nAtomAmount;
+                        txdb.WriteAtomBalance(cancelledOrder.addrMaker, nBal, nNon);
+
+                        txdb.EraseDexOrder(dexCancel.hashOffer);
+
+                        CRITICAL_BLOCK(cs_mapDexOrders)
+                        {
+                            mapDexOrders.erase(dexCancel.hashOffer);
+                        }
+                    }
+
+                    DexMempoolRemove(txhash);
+                }
+                else if (nDexType == ATOM_TYPE_DEX_TAKE)
+                {
+                    if (!VerifyAtomSender(tx, dexTake.addrFrom))
+                        return error("ConnectBlock() : DEX_TAKE sender verification failed in tx %s",
+                                     txhash.ToString().substr(0, 10).c_str());
+
+                    CDexOrderEntry takenOrder;
+                    bool fFound = false;
+                    CRITICAL_BLOCK(cs_mapDexOrders)
+                    {
+                        std::map<uint256, CDexOrderEntry>::iterator it = mapDexOrders.find(dexTake.hashOffer);
+                        if (it != mapDexOrders.end())
+                        {
+                            if (it->second.addrMaker == dexTake.addrFrom)
+                                return error("ConnectBlock() : DEX_TAKE taker is maker in tx %s",
+                                             txhash.ToString().substr(0, 10).c_str());
+                            takenOrder = it->second;
+                            fFound = true;
+                        }
+                    }
+
+                    if (!fFound)
+                        return error("ConnectBlock() : DEX_TAKE references non-existent offer in tx %s",
+                                     txhash.ToString().substr(0, 10).c_str());
+
+                    {
+                        int64 nRequiredBitok = DexComputeBitokPayment(takenOrder.nAtomAmount, takenOrder.nPrice);
+                        if (nRequiredBitok <= 0)
+                            return error("ConnectBlock() : DEX_TAKE computed BITOK payment is zero in tx %s",
+                                         txhash.ToString().substr(0, 10).c_str());
+                        int64 nPaidToMaker = 0;
+                        for (unsigned int vo = 0; vo < tx.vout.size(); vo++)
+                        {
+                            uint160 addrOut;
+                            if (GetScriptAddr(tx.vout[vo].scriptPubKey, addrOut) &&
+                                addrOut == takenOrder.addrMaker)
+                                nPaidToMaker += tx.vout[vo].nValue;
+                        }
+                        if (nPaidToMaker < nRequiredBitok)
+                            return error("ConnectBlock() : DEX_TAKE insufficient BITOK payment: paid %" PRI64d " need %" PRI64d " in tx %s",
+                                         nPaidToMaker, nRequiredBitok,
+                                         txhash.ToString().substr(0, 10).c_str());
+
+                        int64 nBalTaker = 0;
+                        uint32_t nNonceTaker = 0;
+                        txdb.ReadAtomBalance(dexTake.addrFrom, nBalTaker, nNonceTaker);
+                        nBalTaker += takenOrder.nAtomAmount;
+                        txdb.WriteAtomBalance(dexTake.addrFrom, nBalTaker, nNonceTaker);
+                    }
+
+                    txdb.EraseDexOrder(dexTake.hashOffer);
+
+                    CRITICAL_BLOCK(cs_mapDexOrders)
+                    {
+                        mapDexOrders.erase(dexTake.hashOffer);
+                    }
+
+                    DexMempoolRemove(txhash);
+                }
+            }
+        }
+    }
+
+    txdb.WriteAtomTotalMinted(nTotalMinted);
+    } // end ATOM_ACTIVATION_HEIGHT guard
+
+    // Pass 2: script validation (ConnectInputs) and UTXO indexer.
     map<uint256, CTxIndex> mapUnused;
     int64 nFees = 0;
     foreach(CTransaction& tx, vtx)
@@ -1507,11 +2181,11 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex)
         if (!tx.ConnectInputs(txdb, mapUnused, posThisTx, pindex->nHeight, nFees, true, false))
             return false;
 
+        uint256 txhash = tx.GetHash();
+        bool fCoinBase = tx.IsCoinBase();
+
         if (fUseIndexer && !fIndexerRebuilding)
         {
-            uint256 txhash = tx.GetHash();
-            bool fCoinBase = tx.IsCoinBase();
-
             // Index each output as a UTXO
             for (unsigned int n = 0; n < tx.vout.size(); n++)
             {
@@ -1532,8 +2206,6 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex)
                 {
                     const COutPoint& prevout = tx.vin[k].prevout;
 
-                    // Find the sender address via addrout scan of prev outputs
-                    // We must check all possible addresses for this outpoint
                     CTransaction txPrev;
                     if (txdb.ReadDiskTx(prevout.hash, txPrev))
                     {
@@ -1554,6 +2226,44 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex)
 
     if (vtx[0].GetValueOut() > GetBlockValue(nFees))
         return false;
+
+    // ATOM coinbase reward: credit 20 ATOM per 1 BITOK of block subsidy to the miner.
+    if (pindex->nHeight >= ATOM_ACTIVATION_HEIGHT)
+    {
+        uint160 addrMiner;
+        if (GetScriptAddr(vtx[0].vout[0].scriptPubKey, addrMiner))
+        {
+            int64 nSubsidy = (50 * COIN) >> (pindex->nHeight / 210000);
+            int64 nAtomReward = (nSubsidy / COIN) * ATOM_PER_BITOK;
+            if (nAtomReward > 0)
+            {
+                int64 nTotalMinted = 0;
+                txdb.ReadAtomTotalMinted(nTotalMinted);
+                if (nTotalMinted + nAtomReward > ATOM_MAX_SUPPLY)
+                    nAtomReward = ATOM_MAX_SUPPLY - nTotalMinted;
+
+                if (nAtomReward > 0)
+                {
+                    int64 nMinerBal = 0;
+                    uint32_t nMinerNonce = 0;
+                    txdb.ReadAtomBalance(addrMiner, nMinerBal, nMinerNonce);
+                    nMinerBal += nAtomReward;
+
+                    uint256 coinbaseHash = vtx[0].GetHash();
+                    if (!txdb.WriteAtomBalance(addrMiner, nMinerBal, nMinerNonce))
+                        return error("ConnectBlock() : WriteAtomBalance failed for ATOM coinbase reward at height %d", pindex->nHeight);
+                    if (!txdb.WriteAtomTx(coinbaseHash, pindex->nHeight, pindex->nTime, ATOM_TYPE_COINBASE,
+                                          uint160(0), addrMiner, nAtomReward, 0))
+                        return error("ConnectBlock() : WriteAtomTx failed for ATOM coinbase at height %d", pindex->nHeight);
+                    if (fUseIndexer && !fIndexerRebuilding)
+                        txdb.WriteAtomAddrTx(addrMiner, coinbaseHash, pindex->nHeight);
+
+                    nTotalMinted += nAtomReward;
+                    txdb.WriteAtomTotalMinted(nTotalMinted);
+                }
+            }
+        }
+    }
 
     // Update block index on disk without changing it in memory.
     // The memory index structure will be changed after the db commits.
@@ -1671,8 +2381,219 @@ bool ReindexUTXOs()
 
     fIndexerRebuilding = false;
     printf("ReindexUTXOs: completed, indexed %d blocks\n", nProcessed);
+
+    printf("ReindexUTXOs: starting automatic ATOM rescan\n");
+    if (!RescanAtom())
+        return error("ReindexUTXOs: RescanAtom failed");
+
     return true;
 }
+
+bool RescanAtom(boost::function<bool (int, int)> progressCallback)
+{
+    printf("RescanAtom: starting full rescan of ATOM balances and transaction history\n");
+    fflush(stdout);
+
+    if (pindexGenesisBlock == NULL)
+    {
+        printf("[ATOM] RescanAtom: ERROR - no genesis block found, chain not loaded yet!\n");
+        fflush(stdout);
+        return true;
+    }
+    printf("[ATOM] RescanAtom: genesis block found, starting scan...\n");
+    fflush(stdout);
+
+    CTxDB txdb;
+
+    printf("[ATOM] RescanAtom: erasing old ATOM data...\n");
+    fflush(stdout);
+    txdb.TxnBegin();
+    if (!txdb.EraseAllAtomData())
+    {
+        txdb.TxnAbort();
+        printf("[ATOM] RescanAtom: ERROR - EraseAllAtomData failed!\n");
+        fflush(stdout);
+        return error("RescanAtom: EraseAllAtomData failed");
+    }
+    txdb.TxnCommit();
+    printf("[ATOM] RescanAtom: old data erased OK\n");
+    fflush(stdout);
+
+    int nTotalBlocks = 0;
+    for (CBlockIndex* p = pindexGenesisBlock; p; p = p->pnext)
+        nTotalBlocks++;
+    printf("[ATOM] RescanAtom: total blocks to scan: %d\n", nTotalBlocks);
+    fflush(stdout);
+
+    // On a regular node, atomaddrtx is only written for wallet addresses.
+    // On an indexer node, atomaddrtx is written for every address in every block.
+    std::set<uint160> setWalletAddrs;
+    if (!fUseIndexer)
+    {
+        CRITICAL_BLOCK(cs_mapKeys)
+        {
+            for (map<vector<unsigned char>, CPrivKey>::iterator it = mapKeys.begin();
+                 it != mapKeys.end(); ++it)
+                setWalletAddrs.insert(Hash160(it->first));
+        }
+    }
+
+    CBlockIndex* pindex = pindexGenesisBlock;
+    int nProcessed = 0;
+    int nLastPct = -1;
+    const int nBatchSize = 500;
+    int64 nTotalMinted = 0;
+
+    txdb.TxnBegin();
+
+    while (pindex)
+    {
+        if (pindex->nHeight < ATOM_ACTIVATION_HEIGHT)
+        {
+            nProcessed++;
+            pindex = pindex->pnext;
+            continue;
+        }
+
+        CBlock block;
+        if (!block.ReadFromDisk(pindex->nFile, pindex->nBlockPos))
+        {
+            txdb.TxnAbort();
+            printf("RescanAtom: ReadFromDisk failed at height %d\n", pindex->nHeight);
+            return false;
+        }
+
+        for (unsigned int i = 0; i < block.vtx.size(); i++)
+        {
+            const CTransaction& tx = block.vtx[i];
+            uint256 txhash = tx.GetHash();
+
+            CAtomTransfer atomTransfer;
+            if (GetAtomTransfer(tx, atomTransfer))
+            {
+                if (atomTransfer.nType == ATOM_TYPE_COINBASE)
+                {
+                    printf("[ATOM] RescanAtom: skipping invalid COINBASE user tx %s at height %d\n",
+                           txhash.ToString().substr(0, 10).c_str(), pindex->nHeight);
+                    continue;
+                }
+                if (atomTransfer.nType == ATOM_TYPE_TRANSFER)
+                {
+                    int64 nBalFrom = 0;
+                    uint32_t nNonceFrom = 0;
+                    txdb.ReadAtomBalance(atomTransfer.addrFrom, nBalFrom, nNonceFrom);
+                    nBalFrom -= atomTransfer.nAmount;
+                    if (nBalFrom < 0) nBalFrom = 0;
+                    if (atomTransfer.nNonce > nNonceFrom)
+                        nNonceFrom = atomTransfer.nNonce;
+                    txdb.WriteAtomBalance(atomTransfer.addrFrom, nBalFrom, nNonceFrom);
+                    if (fUseIndexer || setWalletAddrs.count(atomTransfer.addrFrom))
+                        txdb.WriteAtomAddrTx(atomTransfer.addrFrom, txhash, pindex->nHeight);
+
+                    int64 nBalTo = 0;
+                    uint32_t nNonceTo = 0;
+                    txdb.ReadAtomBalance(atomTransfer.addrTo, nBalTo, nNonceTo);
+                    nBalTo += atomTransfer.nAmount;
+                    txdb.WriteAtomBalance(atomTransfer.addrTo, nBalTo, nNonceTo);
+                    if (fUseIndexer || setWalletAddrs.count(atomTransfer.addrTo))
+                        txdb.WriteAtomAddrTx(atomTransfer.addrTo, txhash, pindex->nHeight);
+                }
+                else if (atomTransfer.nType == ATOM_TYPE_BRIDGE_TO_SOL)
+                {
+                    int64 nBalFrom = 0;
+                    uint32_t nNonceFrom = 0;
+                    txdb.ReadAtomBalance(atomTransfer.addrFrom, nBalFrom, nNonceFrom);
+                    nBalFrom -= atomTransfer.nAmount;
+                    if (nBalFrom < 0) nBalFrom = 0;
+                    if (atomTransfer.nNonce > nNonceFrom)
+                        nNonceFrom = atomTransfer.nNonce;
+                    txdb.WriteAtomBalance(atomTransfer.addrFrom, nBalFrom, nNonceFrom);
+                    if (fUseIndexer || setWalletAddrs.count(atomTransfer.addrFrom))
+                        txdb.WriteAtomAddrTx(atomTransfer.addrFrom, txhash, pindex->nHeight);
+                }
+                else if (atomTransfer.nType == ATOM_TYPE_BRIDGE_TO_BITOK)
+                {
+                    int64 nBalTo = 0;
+                    uint32_t nNonceTo = 0;
+                    txdb.ReadAtomBalance(atomTransfer.addrTo, nBalTo, nNonceTo);
+                    nBalTo += atomTransfer.nAmount;
+                    txdb.WriteAtomBalance(atomTransfer.addrTo, nBalTo, nNonceTo);
+                    if (fUseIndexer || setWalletAddrs.count(atomTransfer.addrTo))
+                        txdb.WriteAtomAddrTx(atomTransfer.addrTo, txhash, pindex->nHeight);
+
+                    nTotalMinted += atomTransfer.nAmount;
+                }
+
+                txdb.WriteAtomTx(txhash, pindex->nHeight, pindex->nTime, atomTransfer.nType,
+                                 atomTransfer.addrFrom, atomTransfer.addrTo,
+                                 atomTransfer.nAmount, atomTransfer.nNonce,
+                                 atomTransfer.nType == ATOM_TYPE_BRIDGE_TO_SOL ? atomTransfer.solAddrTo : NULL);
+            }
+        }
+
+        // Coinbase ATOM reward
+        {
+            uint160 addrMiner;
+            if (GetScriptAddr(block.vtx[0].vout[0].scriptPubKey, addrMiner))
+            {
+                int64 nSubsidy = (50 * COIN) >> (pindex->nHeight / 210000);
+                int64 nAtomReward = (nSubsidy / COIN) * ATOM_PER_BITOK;
+                if (nAtomReward > 0)
+                {
+                    if (nTotalMinted + nAtomReward > ATOM_MAX_SUPPLY)
+                        nAtomReward = ATOM_MAX_SUPPLY - nTotalMinted;
+
+                    if (nAtomReward > 0)
+                    {
+                    int64 nMinerBal = 0;
+                    uint32_t nMinerNonce = 0;
+                    txdb.ReadAtomBalance(addrMiner, nMinerBal, nMinerNonce);
+                    nMinerBal += nAtomReward;
+                    txdb.WriteAtomBalance(addrMiner, nMinerBal, nMinerNonce);
+
+                    uint256 coinbaseHash = block.vtx[0].GetHash();
+                    txdb.WriteAtomTx(coinbaseHash, pindex->nHeight, pindex->nTime, ATOM_TYPE_COINBASE,
+                                     uint160(0), addrMiner, nAtomReward, 0);
+                    if (fUseIndexer || setWalletAddrs.count(addrMiner))
+                        txdb.WriteAtomAddrTx(addrMiner, coinbaseHash, pindex->nHeight);
+
+                    nTotalMinted += nAtomReward;
+                    }
+                }
+            }
+        }
+
+        nProcessed++;
+
+        if (nProcessed % nBatchSize == 0)
+        {
+            txdb.TxnCommit();
+            txdb.TxnBegin();
+
+            int nPct = (nProcessed * 100) / nTotalBlocks;
+            if (nPct / 10 > nLastPct / 10 && nPct <= 100)
+            {
+                nLastPct = nPct;
+                printf("[ATOM] RescanAtom progress: %d%% (%d/%d blocks, height %d)\n",
+                       (nPct / 10) * 10, nProcessed, nTotalBlocks, pindex->nHeight);
+                fflush(stdout);
+            }
+            if (progressCallback)
+                progressCallback(nProcessed, nTotalBlocks);
+        }
+
+        pindex = pindex->pnext;
+    }
+
+    txdb.WriteAtomTotalMinted(nTotalMinted);
+    txdb.TxnCommit();
+    txdb.Close();
+
+    printf("[ATOM] RescanAtom: COMPLETED, processed %d blocks, totalMinted=%" PRI64d "\n", nProcessed, nTotalMinted);
+    fflush(stdout);
+    return true;
+}
+
 
 bool Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
 {
@@ -4384,6 +5305,32 @@ int64 GetNetworkHashPS(int lookup)
 //
 
 
+bool IsOutputSpent(const uint256& hash, int nOut)
+{
+    COutPoint outpoint(hash, nOut);
+    CRITICAL_BLOCK(cs_mapTransactions)
+    {
+        if (mapNextTx.count(outpoint))
+            return true;
+    }
+    return false;
+}
+
+static int64 GetUnspentCredit(const CWalletTx& wtx)
+{
+    if (wtx.IsCoinBase() && wtx.GetBlocksToMaturity() > 0)
+        return 0;
+
+    int64 nCredit = 0;
+    uint256 hash = wtx.GetHash();
+    for (int i = 0; i < wtx.vout.size(); i++)
+    {
+        if (wtx.vout[i].IsMine() && !IsOutputSpent(hash, i))
+            nCredit += wtx.vout[i].nValue;
+    }
+    return nCredit;
+}
+
 int64 GetBalance()
 {
     int64 nStart = GetTimeMillis();
@@ -4396,7 +5343,15 @@ int64 GetBalance()
             CWalletTx* pcoin = &(*it).second;
             if (!pcoin->IsFinal() || pcoin->fSpent)
                 continue;
-            nTotal += pcoin->GetCredit(true);
+            if (!pcoin->IsInMainChain())
+            {
+                bool fInMempool = false;
+                CRITICAL_BLOCK(cs_mapTransactions)
+                    fInMempool = mapTransactions.count(pcoin->GetHash()) != 0;
+                if (!fInMempool)
+                    continue;
+            }
+            nTotal += GetUnspentCredit(*pcoin);
         }
     }
 
@@ -4410,7 +5365,6 @@ bool SelectCoins(int64 nTargetValue, set<CWalletTx*>& setCoinsRet)
 {
     setCoinsRet.clear();
 
-    // List of values less than target
     int64 nLowestLarger = INT64_MAX;
     CWalletTx* pcoinLowestLarger = NULL;
     vector<pair<int64, CWalletTx*> > vValue;
@@ -4423,7 +5377,15 @@ bool SelectCoins(int64 nTargetValue, set<CWalletTx*>& setCoinsRet)
             CWalletTx* pcoin = &(*it).second;
             if (!pcoin->IsFinal() || pcoin->fSpent)
                 continue;
-            int64 n = pcoin->GetCredit();
+            if (!pcoin->IsInMainChain())
+            {
+                bool fInMempool = false;
+                CRITICAL_BLOCK(cs_mapTransactions)
+                    fInMempool = mapTransactions.count(pcoin->GetHash()) != 0;
+                if (!fInMempool)
+                    continue;
+            }
+            int64 n = GetUnspentCredit(*pcoin);
             if (n <= 0)
                 continue;
             if (n < nTargetValue)
@@ -4452,7 +5414,6 @@ bool SelectCoins(int64 nTargetValue, set<CWalletTx*>& setCoinsRet)
         return true;
     }
 
-    // Solve subset sum by stochastic approximation
     sort(vValue.rbegin(), vValue.rend());
     vector<char> vfIncluded;
     vector<char> vfBest(vValue.size(), true);
@@ -4487,7 +5448,6 @@ bool SelectCoins(int64 nTargetValue, set<CWalletTx*>& setCoinsRet)
         }
     }
 
-    // If the next larger is still closer, return it
     if (pcoinLowestLarger && nLowestLarger - nTargetValue <= nBest - nTargetValue)
         setCoinsRet.insert(pcoinLowestLarger);
     else
@@ -4601,7 +5561,7 @@ bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, CK
                     return false;
                 int64 nValueIn = 0;
                 foreach(CWalletTx* pcoin, setCoins)
-                    nValueIn += pcoin->GetCredit();
+                    nValueIn += GetUnspentCredit(*pcoin);
 
                 // Fill a vout to the payee
                 bool fChangeFirst = GetRand(2);
@@ -4632,26 +5592,20 @@ bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, CK
                 // Fill vin
                 foreach(CWalletTx* pcoin, setCoins)
                     for (int nOut = 0; nOut < pcoin->vout.size(); nOut++)
-                        if (pcoin->vout[nOut].IsMine())
+                        if (pcoin->vout[nOut].IsMine() && !IsOutputSpent(pcoin->GetHash(), nOut))
                             wtxNew.vin.push_back(CTxIn(pcoin->GetHash(), nOut));
 
                 // Sign
                 int nIn = 0;
                 foreach(CWalletTx* pcoin, setCoins)
                     for (int nOut = 0; nOut < pcoin->vout.size(); nOut++)
-                        if (pcoin->vout[nOut].IsMine())
+                        if (pcoin->vout[nOut].IsMine() && !IsOutputSpent(pcoin->GetHash(), nOut))
                             SignSignature(*pcoin, wtxNew, nIn++);
 
-                // Check that enough fee is included
-                bool fAllowFree = false;
-                if (nBestHeight + 1 >= SCRIPT_EXEC_ACTIVATION_HEIGHT)
+                int64 nMinFee = wtxNew.GetMinFee(1, false);
+                if (nFee < nMinFee)
                 {
-                    double dPriority = ComputePriority(wtxNew, txdb, nBestHeight + 1);
-                    fAllowFree = (dPriority >= FREE_PRIORITY_THRESHOLD);
-                }
-                if (nFee < wtxNew.GetMinFee(1, fAllowFree))
-                {
-                    nFee = nFeeRequiredRet = wtxNew.GetMinFee(1, fAllowFree);
+                    nFee = nFeeRequiredRet = nMinFee;
                     continue;
                 }
 
@@ -4692,7 +5646,7 @@ bool CreateStealthTransaction(CScript scriptPubKey, const CScript& scriptOpRetur
                     return false;
                 int64 nValueIn = 0;
                 foreach(CWalletTx* pcoin, setCoins)
-                    nValueIn += pcoin->GetCredit();
+                    nValueIn += GetUnspentCredit(*pcoin);
 
                 bool fChangeFirst = GetRand(2);
                 if (!fChangeFirst)
@@ -4722,24 +5676,184 @@ bool CreateStealthTransaction(CScript scriptPubKey, const CScript& scriptOpRetur
 
                 foreach(CWalletTx* pcoin, setCoins)
                     for (int nOut = 0; nOut < pcoin->vout.size(); nOut++)
-                        if (pcoin->vout[nOut].IsMine())
+                        if (pcoin->vout[nOut].IsMine() && !IsOutputSpent(pcoin->GetHash(), nOut))
                             wtxNew.vin.push_back(CTxIn(pcoin->GetHash(), nOut));
 
                 int nIn = 0;
                 foreach(CWalletTx* pcoin, setCoins)
                     for (int nOut = 0; nOut < pcoin->vout.size(); nOut++)
-                        if (pcoin->vout[nOut].IsMine())
+                        if (pcoin->vout[nOut].IsMine() && !IsOutputSpent(pcoin->GetHash(), nOut))
                             SignSignature(*pcoin, wtxNew, nIn++);
 
-                bool fAllowFree = false;
-                if (nBestHeight + 1 >= SCRIPT_EXEC_ACTIVATION_HEIGHT)
+                int64 nMinFee = wtxNew.GetMinFee(1, false);
+                if (nFee < nMinFee)
                 {
-                    double dPriority = ComputePriority(wtxNew, txdb, nBestHeight + 1);
-                    fAllowFree = (dPriority >= FREE_PRIORITY_THRESHOLD);
+                    nFee = nFeeRequiredRet = nMinFee;
+                    continue;
                 }
-                if (nFee < wtxNew.GetMinFee(1, fAllowFree))
+
+                wtxNew.AddSupportingTransactions(txdb);
+                wtxNew.fTimeReceivedIsTxTime = true;
+
+                break;
+            }
+        }
+    }
+    return true;
+}
+
+
+static bool FindSignerUtxo(const uint160& requiredSigner,
+                           CWalletTx*& pSignerCoin, int& nSignerOut)
+{
+    pSignerCoin = NULL;
+    nSignerOut = -1;
+    for (map<uint256, CWalletTx>::iterator it = mapWallet.begin(); it != mapWallet.end(); ++it)
+    {
+        CWalletTx* pcoin = &(*it).second;
+        if (!pcoin->IsFinal() || pcoin->fSpent)
+            continue;
+        if (!pcoin->IsInMainChain())
+        {
+            bool fInMempool = false;
+            CRITICAL_BLOCK(cs_mapTransactions)
+                fInMempool = mapTransactions.count(pcoin->GetHash()) != 0;
+            if (!fInMempool)
+                continue;
+        }
+        uint256 hash = pcoin->GetHash();
+        for (int nOut = 0; nOut < pcoin->vout.size(); nOut++)
+        {
+            if (!pcoin->vout[nOut].IsMine() || IsOutputSpent(hash, nOut))
+                continue;
+            uint160 h160 = pcoin->vout[nOut].scriptPubKey.GetBitcoinAddressHash160();
+            if (h160 == requiredSigner)
+            {
+                pSignerCoin = pcoin;
+                nSignerOut = nOut;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+
+bool CreateStealthTransaction(CScript scriptPubKey, const CScript& scriptOpReturn,
+                              int64 nValue, CWalletTx& wtxNew, CKey& keyRet,
+                              int64& nFeeRequiredRet, const uint160& requiredSigner,
+                              string* pstrReason)
+{
+    nFeeRequiredRet = 0;
+    CRITICAL_BLOCK(cs_main)
+    {
+        CTxDB txdb("r");
+        CRITICAL_BLOCK(cs_mapWallet)
+        {
+            int64 nFee = nTransactionFee;
+            loop
+            {
+                wtxNew.vin.clear();
+                wtxNew.vout.clear();
+                wtxNew.fFromMe = true;
+                if (nValue < 0)
                 {
-                    nFee = nFeeRequiredRet = wtxNew.GetMinFee(1, fAllowFree);
+                    if (pstrReason) *pstrReason = "Negative value";
+                    return false;
+                }
+                int64 nValueOut = nValue;
+                int64 nTotalValue = nValue + nFee;
+
+                set<CWalletTx*> setCoins;
+                if (!SelectCoins(nTotalValue, setCoins))
+                {
+                    if (pstrReason) *pstrReason = strprintf("SelectCoins failed: need %s Bitok (dust + fee), wallet balance %s",
+                        FormatMoney(nTotalValue).c_str(), FormatMoney(GetBalance()).c_str());
+                    return false;
+                }
+
+                bool fSignerInSet = false;
+                CWalletTx* pSignerCoin = NULL;
+                int nSignerOut = -1;
+
+                foreach(CWalletTx* pcoin, setCoins)
+                {
+                    uint256 hash = pcoin->GetHash();
+                    for (int nOut = 0; nOut < pcoin->vout.size(); nOut++)
+                    {
+                        if (!pcoin->vout[nOut].IsMine() || IsOutputSpent(hash, nOut))
+                            continue;
+                        uint160 h160 = pcoin->vout[nOut].scriptPubKey.GetBitcoinAddressHash160();
+                        if (h160 == requiredSigner)
+                        {
+                            fSignerInSet = true;
+                            break;
+                        }
+                    }
+                    if (fSignerInSet)
+                        break;
+                }
+
+                if (!fSignerInSet)
+                {
+                    if (!FindSignerUtxo(requiredSigner, pSignerCoin, nSignerOut))
+                    {
+                        if (pstrReason) *pstrReason = "No Bitok UTXO found for the ATOM source address. Send a small amount of Bitok to this address first";
+                        return false;
+                    }
+                    setCoins.insert(pSignerCoin);
+                }
+
+                int64 nValueIn = 0;
+                foreach(CWalletTx* pcoin, setCoins)
+                {
+                    uint256 hash = pcoin->GetHash();
+                    for (int nOut = 0; nOut < pcoin->vout.size(); nOut++)
+                        if (pcoin->vout[nOut].IsMine() && !IsOutputSpent(hash, nOut))
+                            nValueIn += pcoin->vout[nOut].nValue;
+                }
+
+                bool fChangeFirst = GetRand(2);
+                if (!fChangeFirst)
+                {
+                    wtxNew.vout.push_back(CTxOut(nValueOut, scriptPubKey));
+                    wtxNew.vout.push_back(CTxOut(0, scriptOpReturn));
+                }
+
+                if (nValueIn > nTotalValue)
+                {
+                    if (keyRet.IsNull())
+                    {
+                        if (!GetStealthChangeKeyForInputs(setCoins, keyRet))
+                            keyRet.MakeNewKey();
+                    }
+
+                    CScript scriptChange;
+                    scriptChange.SetBitcoinAddress(keyRet.GetPubKey());
+                    wtxNew.vout.push_back(CTxOut(nValueIn - nTotalValue, scriptChange));
+                }
+
+                if (fChangeFirst)
+                {
+                    wtxNew.vout.push_back(CTxOut(nValueOut, scriptPubKey));
+                    wtxNew.vout.push_back(CTxOut(0, scriptOpReturn));
+                }
+
+                foreach(CWalletTx* pcoin, setCoins)
+                    for (int nOut = 0; nOut < pcoin->vout.size(); nOut++)
+                        if (pcoin->vout[nOut].IsMine() && !IsOutputSpent(pcoin->GetHash(), nOut))
+                            wtxNew.vin.push_back(CTxIn(pcoin->GetHash(), nOut));
+
+                int nIn = 0;
+                foreach(CWalletTx* pcoin, setCoins)
+                    for (int nOut = 0; nOut < pcoin->vout.size(); nOut++)
+                        if (pcoin->vout[nOut].IsMine() && !IsOutputSpent(pcoin->GetHash(), nOut))
+                            SignSignature(*pcoin, wtxNew, nIn++);
+
+                int64 nMinFee = wtxNew.GetMinFee(1, false);
+                if (nFee < nMinFee)
+                {
+                    nFee = nFeeRequiredRet = nMinFee;
                     continue;
                 }
 

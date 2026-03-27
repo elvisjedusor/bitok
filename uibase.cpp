@@ -566,7 +566,7 @@ CAboutDialogBase::CAboutDialogBase( wxWindow* parent, wxWindowID id, const wxStr
 
 	bSizerText->Add( 0, 8, 0, wxEXPAND, 5 );
 
-	m_staticTextMain = new wxStaticText( this, wxID_ANY, _("Copyright (c) 2009-2010 Satoshi Nakamoto\nCopyright (c) 2024-2026 Tom Elvis Jedusor\n\nThis is experimental software.\n\nDistributed under the MIT/X11 software license, see the accompanying file license.txt or http://www.opensource.org/licenses/mit-license.php.\n\nThis product includes software developed by the OpenSSL Project for use in \nthe OpenSSL Toolkit (http://www.openssl.org/) and cryptographic software \nwritten by Eric Young (eay@cryptsoft.com)."), wxDefaultPosition, wxDefaultSize, 0 );
+	m_staticTextMain = new wxStaticText( this, wxID_ANY, _("Copyright (c) 2009-2010 Satoshi Nakamoto\nCopyright (c) 2026-2026 Tom Elvis Jedusor\n\nThis is experimental software.\n\nDistributed under the MIT/X11 software license, see the accompanying file license.txt or http://www.opensource.org/licenses/mit-license.php.\n\nThis product includes software developed by the OpenSSL Project for use in \nthe OpenSSL Toolkit (http://www.openssl.org/) and cryptographic software \nwritten by Eric Young (eay@cryptsoft.com)."), wxDefaultPosition, wxDefaultSize, 0 );
 	m_staticTextMain->Wrap( 380 );
 	bSizerText->Add( m_staticTextMain, 1, wxALL|wxEXPAND, 5 );
 

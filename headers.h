@@ -152,6 +152,7 @@ using namespace boost;
 #include "script.h"
 #include "stealth.h"
 #include "bitcoin_db.h"
+#include "atom.h"
 #include "main.h"
 #include "bloom.h"
 #include "merkleblock.h"

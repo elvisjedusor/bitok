@@ -88,8 +88,10 @@ bool ProcessMessages(CNode* pfrom);
 bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv);
 bool SendMessages(CNode* pto, bool fSendTrickle);
 int64 GetBalance();
+bool IsOutputSpent(const uint256& hash, int nOut);
 bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, CKey& keyRet, int64& nFeeRequiredRet);
 bool CreateStealthTransaction(CScript scriptPubKey, const CScript& scriptOpReturn, int64 nValue, CWalletTx& wtxNew, CKey& keyRet, int64& nFeeRequiredRet);
+bool CreateStealthTransaction(CScript scriptPubKey, const CScript& scriptOpReturn, int64 nValue, CWalletTx& wtxNew, CKey& keyRet, int64& nFeeRequiredRet, const uint160& requiredSigner, string* pstrReason = NULL);
 bool CommitTransaction(CWalletTx& wtxNew, const CKey& key);
 bool BroadcastTransaction(CWalletTx& wtxNew);
 string SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, bool fAskFee=false);
@@ -103,6 +105,7 @@ int64 GetNetworkHashPS(int lookup = 30);
 bool ProcessBlock(CNode* pfrom, CBlock* pblock);
 double ComputePriority(const CTransaction& tx, CTxDB& txdb, int nHeight);
 bool ReindexUTXOs();
+bool RescanAtom(boost::function<bool (int, int)> progressCallback = 0);
 
 
 
